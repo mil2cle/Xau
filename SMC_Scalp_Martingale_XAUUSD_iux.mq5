@@ -172,6 +172,8 @@ int            g_m5SwingHighBars[];
 int            g_m5SwingLowBars[];
 double         g_m15SwingHighs[];
 double         g_m15SwingLows[];
+int            g_m15SwingHighBars[];
+int            g_m15SwingLowBars[];
 
 // Visual objects
 string         g_objPrefix = "SMC_";
@@ -439,9 +441,8 @@ void CalculateLiquidityLevels()
    CalculateEqualHighsLows();
    
    // Store swing levels
-   int dummy;
    DetectSwings(InpEntryTF, g_m5SwingHighs, g_m5SwingLows, g_m5SwingHighBars, g_m5SwingLowBars, 100);
-   DetectSwings(InpBiasTF, g_m15SwingHighs, g_m15SwingLows, dummy, dummy, 100);
+   DetectSwings(InpBiasTF, g_m15SwingHighs, g_m15SwingLows, g_m15SwingHighBars, g_m15SwingLowBars, 100);
 }
 
 //+------------------------------------------------------------------+
