@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v1.4                         |
+//|                    SMC Scalping Bot v1.5                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
-//|                    + Frequency Boost (STRICT/RELAX)              |
+//|                    + Frequency Boost + RELAX TimeFilter          |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v1.4"
+#property copyright "SMC Scalping Bot v1.5"
 #property link      ""
-#property version   "1.40"
+#property version   "1.50"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -116,11 +116,14 @@ input bool     InpStopTradingOnSLHits = true;         // Stop trading after max 
 input group "=== Frequency Boost (STRICT/RELAX) ==="
 input int      InpTargetTradesPerDay = 3;             // Soft target trades/day (2-3)
 input int      InpMaxTradesPerDay    = 30;            // Hard cap trades/day
-input int      InpRelaxSwitchHour    = 20;            // Switch to RELAX after this hour
+input int      InpRelaxSwitchHour    = 18;            // Switch to RELAX after this hour
 input bool     InpEnableRelaxMode    = true;          // Enable RELAX mode
 input double   InpRelaxLotFactor     = 0.5;           // RELAX lot factor (reduce lot)
 input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRICT mode
 input bool     InpRelaxAllowBiasNone = true;          // RELAX allows bias=none
+input bool     InpRelaxIgnoreTimeFilter = true;       // RELAX ignores timefilter when below target
+input int      InpNoTradeStartHHMM   = 2355;          // No-trade zone start (HHMM) - rollover
+input int      InpNoTradeEndHHMM     = 10;            // No-trade zone end (HHMM) - rollover
 
 input group "=== Time Filter ==="
 input string   InpTradeStart        = "14:00";        // Trade start time (server)
@@ -309,12 +312,13 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v1.4 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v1.5 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
    Print("Target Trades: ", InpTargetTradesPerDay, " | Max Trades: ", InpMaxTradesPerDay);
    Print("RELAX Mode: ", InpEnableRelaxMode, " | Switch Hour: ", InpRelaxSwitchHour);
+   Print("RELAX Ignore TimeFilter: ", InpRelaxIgnoreTimeFilter, " | NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM);
    
    return(INIT_SUCCEEDED);
 }
@@ -1573,10 +1577,18 @@ void CheckTradeResult()
 //+------------------------------------------------------------------+
 bool PassRiskChecks()
 {
-   // Time filter
-   if(!IsWithinTradingHours())
+   // Time filter with RELAX mode support
+   if(!CheckTradingTime())
    {
-      LogCancelReason("timefilter");
+      // Check if it's rollover zone for specific logging
+      if(IsInNoTradeZone())
+      {
+         LogCancelReason("rollover");
+      }
+      else
+      {
+         LogCancelReason("timefilter");
+      }
       return false;
    }
    
@@ -1662,6 +1674,59 @@ bool IsWithinTradingHours()
    int endMinutes = endHour * 60 + endMin;
    
    return (currentMinutes >= startMinutes && currentMinutes <= endMinutes);
+}
+
+//+------------------------------------------------------------------+
+//| Check if in no-trade zone (rollover protection)                    |
+//+------------------------------------------------------------------+
+bool IsInNoTradeZone()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int currentHHMM = dt.hour * 100 + dt.min;
+   
+   // Handle rollover zone that spans midnight
+   if(InpNoTradeStartHHMM > InpNoTradeEndHHMM)
+   {
+      // Zone spans midnight (e.g., 2355 to 0010)
+      return (currentHHMM >= InpNoTradeStartHHMM || currentHHMM <= InpNoTradeEndHHMM);
+   }
+   else
+   {
+      // Normal zone within same day
+      return (currentHHMM >= InpNoTradeStartHHMM && currentHHMM <= InpNoTradeEndHHMM);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check trading time with RELAX mode support                         |
+//+------------------------------------------------------------------+
+bool CheckTradingTime()
+{
+   // Always block no-trade zone (rollover)
+   if(IsInNoTradeZone())
+   {
+      return false;
+   }
+   
+   // MODE_STRICT: use original timefilter
+   if(g_tradeMode == MODE_STRICT)
+   {
+      return IsWithinTradingHours();
+   }
+   
+   // MODE_RELAX: check if we can ignore timefilter
+   if(g_tradeMode == MODE_RELAX && InpRelaxIgnoreTimeFilter)
+   {
+      // Only ignore timefilter if below target
+      if(g_tradesToday < InpTargetTradesPerDay)
+      {
+         return true;  // Allow trading outside normal hours
+      }
+   }
+   
+   // Default: use original timefilter
+   return IsWithinTradingHours();
 }
 
 //+------------------------------------------------------------------+
@@ -2071,11 +2136,24 @@ void LogCancelReason(string reason)
    if(!InpEnableLogging) return;
    
    // Rate limit logging to avoid spam
+   // Use different throttle times for different reasons
    static datetime lastLogTime = 0;
    static string lastReason = "";
+   static datetime lastTimeFilterLog = 0;
    
-   if(reason == lastReason && TimeCurrent() - lastLogTime < 60)
-      return;
+   // Timefilter/rollover: throttle to 15 minutes (900 seconds)
+   if(reason == "timefilter" || reason == "rollover")
+   {
+      if(TimeCurrent() - lastTimeFilterLog < 900)
+         return;
+      lastTimeFilterLog = TimeCurrent();
+   }
+   else
+   {
+      // Other reasons: throttle to 60 seconds per unique reason
+      if(reason == lastReason && TimeCurrent() - lastLogTime < 60)
+         return;
+   }
    
    lastLogTime = TimeCurrent();
    lastReason = reason;
@@ -2412,7 +2490,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.4", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.5", textColor);
    
    // Trade Mode display with color
    string modeStr = (g_tradeMode == MODE_STRICT) ? "STRICT" : "RELAX";
