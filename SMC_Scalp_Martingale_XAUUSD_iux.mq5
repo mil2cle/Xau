@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v2.2                         |
+//|                    SMC Scalping Bot v2.3                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v2.2"
+#property copyright "SMC Scalping Bot v2.3"
 #property link      ""
-#property version   "2.20"
+#property version   "2.30"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -140,6 +140,8 @@ input int      InpATRPeriod         = 14;             // ATR period
 input group "=== CHOCH Mode ==="
 input ENUM_CHOCH_MODE InpChochModeStrict = CHOCH_CLOSE_ONLY;  // CHOCH mode STRICT
 input ENUM_CHOCH_MODE InpChochModeRelax  = CHOCH_WICK_OK;     // CHOCH mode RELAX/RELAX2
+input bool     InpUse2StageChoch     = true;           // Use 2-stage CHOCH for RELAX modes
+input int      InpStage2ConfirmBars  = 3;              // Stage2 close-confirm window (bars after wick BOS)
 
 input group "=== SL/TP Parameters ==="
 input int      InpSLBufferPoints    = 40;             // SL buffer min (points)
@@ -185,8 +187,8 @@ input int      InpRelaxSweepBreakPoints = 8;          // RELAX sweep break point
 input int      InpRelaxRollingLiqBars   = 36;         // RELAX rolling liquidity bars
 input int      InpRelaxReclaimMaxBars   = 3;          // RELAX reclaim max bars (increased)
 input int      InpRelaxSwingK           = 1;          // RELAX swing lookback (1 = faster swing detection)
-input int      InpRelaxConfirmMaxBars   = 15;         // RELAX CHOCH confirm max bars (increased more)
-input int      InpRelaxEntryTimeoutBars = 30;         // RELAX entry timeout bars (increased more)
+input int      InpRelaxConfirmMaxBars   = 14;         // RELAX CHOCH confirm max bars (12-16 range)
+input int      InpRelaxEntryTimeoutBars = 35;         // RELAX entry timeout bars (slightly increased)
 input double   InpRelaxRetraceRatio     = 0.30;       // RELAX retrace ratio (0.30 = 30%, easier entry)
 
 input group "=== RELAX2 Mode (End of Day) ==="
@@ -198,9 +200,9 @@ input int      InpRelax2RollingLiqBars   = 24;        // RELAX2 rolling liquidit
 input bool     InpRelax2AllowBiasNone    = true;      // RELAX2 allows bias=none
 input int      InpRelax2ReclaimMaxBars   = 4;         // RELAX2 reclaim max bars (more relaxed)
 input int      InpRelax2SwingK           = 1;         // RELAX2 swing lookback (1 = faster swing detection)
-input int      InpRelax2ConfirmMaxBars   = 25;        // RELAX2 CHOCH confirm max bars (much more relaxed)
-input int      InpRelax2EntryTimeoutBars = 45;        // RELAX2 entry timeout bars (much more relaxed)
-input double   InpRelax2RetraceRatio     = 0.20;      // RELAX2 retrace ratio (0.20 = 20%, easiest entry)
+input int      InpRelax2ConfirmMaxBars   = 18;        // RELAX2 CHOCH confirm max bars (16-20 range)
+input int      InpRelax2EntryTimeoutBars = 50;        // RELAX2 entry timeout bars (slightly increased)
+input double   InpRelax2RetraceRatio     = 0.22;      // RELAX2 retrace ratio (0.20-0.25 range)
 
 input group "=== Martingale ==="
 input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRICT mode
@@ -258,6 +260,11 @@ ENUM_LIQUIDITY_TYPE g_sweepLiqType = LIQ_NONE;
 int            g_sweepBar = 0;
 double         g_chochLevel = 0;
 int            g_chochBar = 0;
+
+// 2-stage CHOCH tracking
+bool           g_chochStage1 = false;      // Stage1: wick BOS detected
+double         g_chochStage1Level = 0;     // Level where wick BOS occurred
+int            g_chochStage1Bar = 0;       // Bar counter since stage1
 double         g_zoneHigh = 0, g_zoneLow = 0;
 ENUM_ZONE_TYPE g_zoneType = ZONE_NONE;
 int            g_zoneBar = 0;
@@ -463,7 +470,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v2.2 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v2.3 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -471,6 +478,7 @@ int OnInit()
    Print("RELAX: ", InpEnableRelaxMode, " @", InpRelaxSwitchHour, ":00 | Sweep: ", InpRelaxSweepBreakPoints, "pts | SwingK: ", InpRelaxSwingK, " | ConfirmBars: ", InpRelaxConfirmMaxBars);
    Print("RELAX2: ", InpEnableRelax2, " @", InpRelax2Hour, ":00 | Sweep: ", InpRelax2SweepBreakPoints, "pts | SwingK: ", InpRelax2SwingK, " | ConfirmBars: ", InpRelax2ConfirmMaxBars);
    Print("ATR Sweep: ", InpUseATRSweepThreshold, " | Factor: ", InpSweepATRFactor, " | STRICT ConfirmBars: ", InpConfirmMaxBars);
+   Print("2-Stage CHOCH: ", InpUse2StageChoch, " | Stage2 Confirm: ", InpStage2ConfirmBars, " bars");
    Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Hard Block: ", InpEnableHardBlock ? StringFormat("%04d", InpHardBlockAfterHHMM) : "OFF");
    Print("24h Trading: ", InpEnable24hTrading, " | CSV Logging: ", InpEnableCSVLogging);
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
@@ -516,7 +524,7 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot v2.2 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v2.3 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -1146,13 +1154,24 @@ bool IsSweepLevel(double level, double sweepBreak, bool isHigh)
 
 //=== CHOCH DETECTION ===
 //+------------------------------------------------------------------+
-//| Look for Change of Character                                       |
+//| Look for Change of Character (with optional 2-stage confirm)       |
 //+------------------------------------------------------------------+
 void LookForChoCH()
 {
    // Check timeout using mode-based parameter
    int confirmMaxBars = GetConfirmMaxBars();
    int barsSinceSweep = g_sweepBar;
+   
+   // For 2-stage mode: also check stage2 timeout
+   if(g_chochStage1 && g_chochStage1Bar > InpStage2ConfirmBars)
+   {
+      // Stage1 wick BOS detected but close-confirm timed out
+      LogSetup("WAIT_CHOCH", "stage2_timeout", g_bias, true, false, ZONE_NONE, 0, 0, 0);
+      RecordCancel(CANCEL_CHOCH_TIMEOUT);
+      ResetSetup();
+      return;
+   }
+   
    if(barsSinceSweep > confirmMaxBars)
    {
       LogSetup("WAIT_CHOCH", "timeout", g_bias, true, false, ZONE_NONE, 0, 0, 0);
@@ -1163,6 +1182,7 @@ void LookForChoCH()
    
    // Get CHOCH mode based on trade mode
    ENUM_CHOCH_MODE chochMode = GetChochMode();
+   bool use2Stage = InpUse2StageChoch && (g_tradeMode != MODE_STRICT);
    
    int minorSwingBar;
    
@@ -1178,27 +1198,52 @@ void LookForChoCH()
          
          bool chochConfirmed = false;
          
-         if(chochMode == CHOCH_CLOSE_ONLY)
+         if(chochMode == CHOCH_CLOSE_ONLY || !use2Stage)
          {
-            // STRICT: require close above level
+            // STRICT or non-2stage: require close above level
             chochConfirmed = (close > minorSwingHigh);
          }
-         else // CHOCH_WICK_OK
+         else // CHOCH_WICK_OK with 2-stage
          {
-            // RELAX: allow wick above level (high > level)
-            chochConfirmed = (high > minorSwingHigh);
+            // 2-stage confirmation for RELAX modes
+            if(!g_chochStage1)
+            {
+               // Stage1: check for wick BOS
+               if(high > minorSwingHigh)
+               {
+                  g_chochStage1 = true;
+                  g_chochStage1Level = minorSwingHigh;
+                  g_chochStage1Bar = 0;
+                  Print("Bullish CHOCH Stage1 (wick BOS) at ", minorSwingHigh);
+               }
+            }
+            else
+            {
+               // Stage2: require close-confirm within N bars
+               if(close > g_chochStage1Level)
+               {
+                  chochConfirmed = true;
+                  Print("Bullish CHOCH Stage2 (close confirm) at ", g_chochStage1Level, " after ", g_chochStage1Bar, " bars");
+               }
+               g_chochStage1Bar++;
+            }
          }
          
          if(chochConfirmed)
          {
-            g_chochLevel = minorSwingHigh;
+            g_chochLevel = (g_chochStage1) ? g_chochStage1Level : minorSwingHigh;
             g_chochBar = 0;
             g_state = STATE_WAIT_RETRACE;
+            
+            // Reset stage1 tracking
+            g_chochStage1 = false;
+            g_chochStage1Level = 0;
+            g_chochStage1Bar = 0;
             
             // Build zones
             BuildZones(true);
             
-            Print("Bullish CHOCH confirmed at ", g_chochLevel, " (mode: ", EnumToString(chochMode), ")");
+            Print("Bullish CHOCH confirmed at ", g_chochLevel, " (mode: ", EnumToString(chochMode), ", 2stage: ", use2Stage, ")");
          }
       }
    }
@@ -1214,27 +1259,52 @@ void LookForChoCH()
          
          bool chochConfirmed = false;
          
-         if(chochMode == CHOCH_CLOSE_ONLY)
+         if(chochMode == CHOCH_CLOSE_ONLY || !use2Stage)
          {
-            // STRICT: require close below level
+            // STRICT or non-2stage: require close below level
             chochConfirmed = (close < minorSwingLow);
          }
-         else // CHOCH_WICK_OK
+         else // CHOCH_WICK_OK with 2-stage
          {
-            // RELAX: allow wick below level (low < level)
-            chochConfirmed = (low < minorSwingLow);
+            // 2-stage confirmation for RELAX modes
+            if(!g_chochStage1)
+            {
+               // Stage1: check for wick BOS
+               if(low < minorSwingLow)
+               {
+                  g_chochStage1 = true;
+                  g_chochStage1Level = minorSwingLow;
+                  g_chochStage1Bar = 0;
+                  Print("Bearish CHOCH Stage1 (wick BOS) at ", minorSwingLow);
+               }
+            }
+            else
+            {
+               // Stage2: require close-confirm within N bars
+               if(close < g_chochStage1Level)
+               {
+                  chochConfirmed = true;
+                  Print("Bearish CHOCH Stage2 (close confirm) at ", g_chochStage1Level, " after ", g_chochStage1Bar, " bars");
+               }
+               g_chochStage1Bar++;
+            }
          }
          
          if(chochConfirmed)
          {
-            g_chochLevel = minorSwingLow;
+            g_chochLevel = (g_chochStage1) ? g_chochStage1Level : minorSwingLow;
             g_chochBar = 0;
             g_state = STATE_WAIT_RETRACE;
+            
+            // Reset stage1 tracking
+            g_chochStage1 = false;
+            g_chochStage1Level = 0;
+            g_chochStage1Bar = 0;
             
             // Build zones
             BuildZones(false);
             
-            Print("Bearish CHOCH confirmed at ", g_chochLevel, " (mode: ", EnumToString(chochMode), ")");
+            Print("Bearish CHOCH confirmed at ", g_chochLevel, " (mode: ", EnumToString(chochMode), ", 2stage: ", use2Stage, ")");
          }
       }
    }
@@ -3078,6 +3148,12 @@ void ResetSetup()
    g_sweepBar = 0;
    g_chochLevel = 0;
    g_chochBar = 0;
+   
+   // Reset 2-stage CHOCH
+   g_chochStage1 = false;
+   g_chochStage1Level = 0;
+   g_chochStage1Bar = 0;
+   
    g_zoneHigh = 0;
    g_zoneLow = 0;
    g_zoneType = ZONE_NONE;
@@ -3422,7 +3498,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.2", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.3", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
