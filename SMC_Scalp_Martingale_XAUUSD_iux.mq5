@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v2.6                         |
+//|                    SMC Scalping Bot v2.7                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v2.6"
+#property copyright "SMC Scalping Bot v2.7"
 #property link      ""
-#property version   "2.60"
+#property version   "2.70"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -170,6 +170,7 @@ input group "=== Frequency Boost (Tiered RELAX) ==="
 input int      InpTargetTradesPerDay = 3;             // Soft target trades/day (2-3)
 input int      InpMaxTradesPerDay    = 30;            // Hard cap trades/day
 input int      InpMinMinutesBetweenTrades = 10;       // Min minutes between trades (reduced from 15)
+input bool     InpUseTargetFirstPolicy = true;        // Target-first: RELAX until target reached, then STRICT
 
 input group "=== No-Trade Zone (Rollover Quarantine) ==="
 input int      InpNoTradeStartHHMM   = 2355;          // No-trade zone start (HHMM) - default 23:55
@@ -207,9 +208,12 @@ input double   InpRelax2RetraceRatio     = 0.22;      // RELAX2 retrace ratio (0
 input bool     InpEnableMicroChochRelax  = true;       // Enable micro CHOCH for RELAX mode
 input bool     InpEnableMicroChochRelax2 = true;       // Enable micro CHOCH for RELAX2 mode
 input double   InpMicroChochStartPct     = 0.55;       // Start micro CHOCH at this % of window (0.55 = 55%)
-input int      InpMicroBreakPts          = 5;          // Micro CHOCH min break size (points) - simplified
-input int      InpMicroMinBodyPts        = 5;          // Micro CHOCH min body size (points) - simplified
+input int      InpMicroBreakPtsRelax     = 3;          // RELAX: min break size (points)
+input int      InpMicroBodyPtsRelax      = 3;          // RELAX: min body size (points)
+input int      InpMicroBreakPtsRelax2    = 3;          // RELAX2: min break size (points)
+input int      InpMicroBodyPtsRelax2     = 3;          // RELAX2: min body size (points)
 input int      InpMicroSwingLookback     = 1;          // Micro swing lookback bars (1-2)
+input bool     InpMicroAllowWickBreak    = true;       // Allow wick break (then require body confirm)
 
 input group "=== Martingale ==="
 input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRICT mode
@@ -379,6 +383,10 @@ int            g_totalTradesExecuted = 0;
 double         g_totalPnL = 0;
 int            g_totalSlHits = 0;
 
+// Mode time counters (bars spent in each mode)
+int            g_modeTimeBars[3];           // Daily: bars in STRICT/RELAX/RELAX2
+int            g_totalModeTimeBars[3];      // All time: bars in each mode
+
 // CSV file handle
 int            g_csvFileHandle = INVALID_HANDLE;
 string         g_csvFileName = "";
@@ -496,6 +504,9 @@ int OnInit()
       g_totalMicrochochPass[m] = 0;
       g_totalMicrochochFailBreak[m] = 0;
       g_totalMicrochochFailBody[m] = 0;
+      // Initialize mode time counters
+      g_modeTimeBars[m] = 0;
+      g_totalModeTimeBars[m] = 0;
    }
    
    // Initialize CSV logging
@@ -511,17 +522,20 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v2.6 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v2.7 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
    Print("Target Trades: ", InpTargetTradesPerDay, " | Max Trades: ", InpMaxTradesPerDay, " | Cooldown: ", InpMinMinutesBetweenTrades, "m");
+   Print("Policy: ", InpUseTargetFirstPolicy ? "TARGET-FIRST (RELAX until target)" : "TIME-BASED (hour-based)");
    Print("RELAX: ", InpEnableRelaxMode, " @", InpRelaxSwitchHour, ":00 | Sweep: ", InpRelaxSweepBreakPoints, "pts | SwingK: ", InpRelaxSwingK, " | ConfirmBars: ", InpRelaxConfirmMaxBars);
    Print("RELAX2: ", InpEnableRelax2, " @", InpRelax2Hour, ":00 | Sweep: ", InpRelax2SweepBreakPoints, "pts | SwingK: ", InpRelax2SwingK, " | ConfirmBars: ", InpRelax2ConfirmMaxBars);
    Print("ATR Sweep: ", InpUseATRSweepThreshold, " | Factor: ", InpSweepATRFactor, " | STRICT ConfirmBars: ", InpConfirmMaxBars);
    Print("2-Stage CHOCH: ", InpUse2StageChoch, " | Stage2 Confirm: ", InpStage2ConfirmBars, " bars");
    Print("Micro CHOCH: RELAX=", InpEnableMicroChochRelax, " RELAX2=", InpEnableMicroChochRelax2, 
-         " | Start@", (int)(InpMicroChochStartPct*100), "% | Break>=", InpMicroBreakPts, "pts | Body>=", InpMicroMinBodyPts, "pts | Lookback=", InpMicroSwingLookback);
+         " | Start@", (int)(InpMicroChochStartPct*100), "% | WickBreak=", InpMicroAllowWickBreak);
+   Print("Micro Params: RELAX Break/Body=", InpMicroBreakPtsRelax, "/", InpMicroBodyPtsRelax, 
+         "pts | RELAX2 Break/Body=", InpMicroBreakPtsRelax2, "/", InpMicroBodyPtsRelax2, "pts");
    Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Hard Block: ", InpEnableHardBlock ? StringFormat("%04d", InpHardBlockAfterHHMM) : "OFF");
    Print("24h Trading: ", InpEnable24hTrading, " | CSV Logging: ", InpEnableCSVLogging);
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
@@ -567,7 +581,7 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot v2.6 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v2.7 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -1397,9 +1411,18 @@ bool TryMicroChochFallback()
    double bodySize = MathAbs(close - open);
    int bodyPoints = (int)(bodySize / _Point);
    
-   // SIMPLIFIED: Just use fixed minimum body (no ATR)
-   int minBodyPts = InpMicroMinBodyPts;
-   int minBreakPts = InpMicroBreakPts;
+   // Get mode-specific parameters
+   int minBodyPts, minBreakPts;
+   if(g_tradeMode == MODE_RELAX2)
+   {
+      minBodyPts = InpMicroBodyPtsRelax2;
+      minBreakPts = InpMicroBreakPtsRelax2;
+   }
+   else // MODE_RELAX or fallback
+   {
+      minBodyPts = InpMicroBodyPtsRelax;
+      minBreakPts = InpMicroBreakPtsRelax;
+   }
    
    // Check body size first
    if(bodyPoints < minBodyPts)
@@ -1413,6 +1436,7 @@ bool TryMicroChochFallback()
    bool hasBreak = false;
    double microLevel = 0;
    int breakPts = 0;
+   bool isWickBreak = false;
    
    if(g_sweepType == SWEEP_BULLISH)
    {
@@ -1424,14 +1448,29 @@ bool TryMicroChochFallback()
          if(h > microSwingHigh) microSwingHigh = h;
       }
       
-      // Check close break (simplified - just close, not wick)
-      if(microSwingHigh > 0 && close > microSwingHigh)
+      if(microSwingHigh > 0)
       {
-         breakPts = (int)((close - microSwingHigh) / _Point);
-         if(breakPts >= minBreakPts)
+         // Check close break first
+         if(close > microSwingHigh)
          {
-            hasBreak = true;
-            microLevel = microSwingHigh;
+            breakPts = (int)((close - microSwingHigh) / _Point);
+            if(breakPts >= minBreakPts)
+            {
+               hasBreak = true;
+               microLevel = microSwingHigh;
+            }
+         }
+         // If no close break, check wick break (if enabled)
+         else if(InpMicroAllowWickBreak && high > microSwingHigh)
+         {
+            breakPts = (int)((high - microSwingHigh) / _Point);
+            if(breakPts >= minBreakPts && bodyPoints >= minBodyPts)
+            {
+               // Wick break with body confirmation
+               hasBreak = true;
+               microLevel = microSwingHigh;
+               isWickBreak = true;
+            }
          }
       }
    }
@@ -1445,14 +1484,29 @@ bool TryMicroChochFallback()
          if(l < microSwingLow) microSwingLow = l;
       }
       
-      // Check close break (simplified - just close, not wick)
-      if(microSwingLow < DBL_MAX && close < microSwingLow)
+      if(microSwingLow < DBL_MAX)
       {
-         breakPts = (int)((microSwingLow - close) / _Point);
-         if(breakPts >= minBreakPts)
+         // Check close break first
+         if(close < microSwingLow)
          {
-            hasBreak = true;
-            microLevel = microSwingLow;
+            breakPts = (int)((microSwingLow - close) / _Point);
+            if(breakPts >= minBreakPts)
+            {
+               hasBreak = true;
+               microLevel = microSwingLow;
+            }
+         }
+         // If no close break, check wick break (if enabled)
+         else if(InpMicroAllowWickBreak && low < microSwingLow)
+         {
+            breakPts = (int)((microSwingLow - low) / _Point);
+            if(breakPts >= minBreakPts && bodyPoints >= minBodyPts)
+            {
+               // Wick break with body confirmation
+               hasBreak = true;
+               microLevel = microSwingLow;
+               isWickBreak = true;
+            }
          }
       }
    }
@@ -1481,8 +1535,9 @@ bool TryMicroChochFallback()
    // Record that micro CHOCH was used (info counter)
    RecordCancel(INFO_MICROCHOCH_USED);
    
-   Print("MICRO CHOCH [" + EnumToString(g_tradeMode) + "] at ", microLevel, 
-         " | Break: ", breakPts, "pts (min:", minBreakPts, ") | Body: ", bodyPoints, "pts (min:", minBodyPts, ")");
+   string breakType = isWickBreak ? "WICK" : "CLOSE";
+   Print("MICRO CHOCH [", EnumToString(g_tradeMode), "] at ", microLevel, 
+         " | ", breakType, " Break: ", breakPts, "pts (min:", minBreakPts, ") | Body: ", bodyPoints, "pts (min:", minBodyPts, ")");
    return true;
 }
 
@@ -2470,35 +2525,73 @@ void UpdateTradeMode()
    // Save previous mode for logging
    g_prevTradeMode = g_tradeMode;
    
-   // Default to STRICT
-   g_tradeMode = MODE_STRICT;
-   
    // Check if below target
    bool belowTarget = (g_tradesToday < InpTargetTradesPerDay);
-   
-   if(!belowTarget)
-   {
-      // Already reached target - stay STRICT
-      if(g_tradeMode != g_prevTradeMode) LogModeChange();
-      return;
-   }
    
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    int currentHour = dt.hour;
    
-   // Tiered RELAX logic:
-   // 1. Check RELAX2 first (higher priority if enabled and past hour)
-   if(InpEnableRelax2 && currentHour >= InpRelax2Hour)
+   // === TARGET-FIRST POLICY ===
+   // If enabled: Use RELAX until target reached, then switch to STRICT
+   if(InpUseTargetFirstPolicy)
    {
-      g_tradeMode = MODE_RELAX2;
+      if(belowTarget)
+      {
+         // Below target: Use RELAX or RELAX2 based on time
+         if(InpEnableRelax2 && currentHour >= InpRelax2Hour)
+         {
+            g_tradeMode = MODE_RELAX2;
+         }
+         else if(InpEnableRelaxMode)
+         {
+            // Use RELAX as default mode when below target
+            g_tradeMode = MODE_RELAX;
+         }
+         else
+         {
+            // Fallback to STRICT if RELAX disabled
+            g_tradeMode = MODE_STRICT;
+         }
+      }
+      else
+      {
+         // Target reached: Switch to STRICT for quality control
+         g_tradeMode = MODE_STRICT;
+      }
    }
-   // 2. Check RELAX
-   else if(InpEnableRelaxMode && currentHour >= InpRelaxSwitchHour)
+   // === LEGACY TIME-BASED POLICY ===
+   else
    {
-      g_tradeMode = MODE_RELAX;
+      // Default to STRICT
+      g_tradeMode = MODE_STRICT;
+      
+      if(belowTarget)
+      {
+         // Tiered RELAX logic based on time
+         if(InpEnableRelax2 && currentHour >= InpRelax2Hour)
+         {
+            g_tradeMode = MODE_RELAX2;
+         }
+         else if(InpEnableRelaxMode && currentHour >= InpRelaxSwitchHour)
+         {
+            g_tradeMode = MODE_RELAX;
+         }
+      }
    }
-   // 3. Otherwise stay STRICT
+   
+   // Update mode time counter (per bar)
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(tradeSym, InpEntryTF, 0);
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      int modeIdx = (int)g_tradeMode;
+      if(modeIdx >= 0 && modeIdx < 3)
+      {
+         g_modeTimeBars[modeIdx]++;
+      }
+   }
    
    // Log mode change
    if(g_tradeMode != g_prevTradeMode)
@@ -2513,24 +2606,29 @@ void UpdateTradeMode()
 void LogModeChange()
 {
    string reason = "";
+   string policy = InpUseTargetFirstPolicy ? "TARGET-FIRST" : "TIME-BASED";
    
    switch(g_tradeMode)
    {
       case MODE_RELAX2:
-         reason = StringFormat("Below target (%d/%d) after RELAX2 hour (%d:00)",
+         reason = StringFormat("Below target (%d/%d) + late hour (%d:00+)",
                                g_tradesToday, InpTargetTradesPerDay, InpRelax2Hour);
          break;
       case MODE_RELAX:
-         reason = StringFormat("Below target (%d/%d) after RELAX hour (%d:00)",
-                               g_tradesToday, InpTargetTradesPerDay, InpRelaxSwitchHour);
+         if(InpUseTargetFirstPolicy)
+            reason = StringFormat("Below target (%d/%d) - using RELAX to find opportunities",
+                                  g_tradesToday, InpTargetTradesPerDay);
+         else
+            reason = StringFormat("Below target (%d/%d) after RELAX hour (%d:00)",
+                                  g_tradesToday, InpTargetTradesPerDay, InpRelaxSwitchHour);
          break;
       default:
-         reason = StringFormat("Target reached (%d/%d) or before switch hours",
+         reason = StringFormat("Target reached (%d/%d) - switching to STRICT for quality",
                                g_tradesToday, InpTargetTradesPerDay);
          break;
    }
    
-   Print("=== MODE CHANGE ===");
+   Print("=== MODE CHANGE [", policy, "] ===");
    Print(EnumToString(g_prevTradeMode), " -> ", EnumToString(g_tradeMode));
    Print("Reason: ", reason);
 }
@@ -3174,6 +3272,8 @@ void ResetDailyCounters()
          g_totalMicrochochPass[m] += g_microchochPass[m];
          g_totalMicrochochFailBreak[m] += g_microchochFailBreak[m];
          g_totalMicrochochFailBody[m] += g_microchochFailBody[m];
+         // Add mode time counters
+         g_totalModeTimeBars[m] += g_modeTimeBars[m];
       }
    }
    
@@ -3205,6 +3305,7 @@ void ResetDailyCounters()
       g_microchochPass[m] = 0;
       g_microchochFailBreak[m] = 0;
       g_microchochFailBody[m] = 0;
+      g_modeTimeBars[m] = 0;
    }
    
    Print("=== DAILY RESET ===");
@@ -3310,12 +3411,14 @@ void PrintFinalSummary()
    
    // Add current day's microchoch counters to totals
    int finalMicroAttempted[3], finalMicroPass[3], finalMicroFailBreak[3], finalMicroFailBody[3];
+   int finalModeTimeBars[3];
    for(int m = 0; m < 3; m++)
    {
       finalMicroAttempted[m] = g_totalMicrochochAttempted[m] + g_microchochAttempted[m];
       finalMicroPass[m] = g_totalMicrochochPass[m] + g_microchochPass[m];
       finalMicroFailBreak[m] = g_totalMicrochochFailBreak[m] + g_microchochFailBreak[m];
       finalMicroFailBody[m] = g_totalMicrochochFailBody[m] + g_microchochFailBody[m];
+      finalModeTimeBars[m] = g_totalModeTimeBars[m] + g_modeTimeBars[m];
    }
    
    if(totalDays == 0 && g_tradesToday > 0)
@@ -3329,6 +3432,24 @@ void PrintFinalSummary()
    Print("Average trades/day: ", totalDays > 0 ? DoubleToString((double)totalTrades / totalDays, 2) : "0");
    Print("Total SL hits: ", totalSL);
    Print("Total PnL: ", DoubleToString(totalPnL, 2));
+   Print("Policy: ", InpUseTargetFirstPolicy ? "TARGET-FIRST" : "TIME-BASED");
+   Print("");
+   
+   // Print mode time distribution
+   Print("--- Mode Time Distribution (Bars) ---");
+   int totalBars = finalModeTimeBars[0] + finalModeTimeBars[1] + finalModeTimeBars[2];
+   string modeNamesTime[3] = {"STRICT", "RELAX", "RELAX2"};
+   if(totalBars > 0)
+   {
+      for(int m = 0; m < 3; m++)
+      {
+         if(finalModeTimeBars[m] > 0)
+         {
+            double pct = (double)finalModeTimeBars[m] / totalBars * 100;
+            Print("  ", modeNamesTime[m], ": ", finalModeTimeBars[m], " bars (", DoubleToString(pct, 1), "%)");
+         }
+      }
+   }
    Print("");
    
    // Print microchoch diagnostics (ALL TIME)
@@ -3797,7 +3918,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.6", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.7", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
