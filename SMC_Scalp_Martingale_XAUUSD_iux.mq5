@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v1.7                         |
+//|                    SMC Scalping Bot v1.8                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
-//|                    + Mode-Based Spread + Spike Filter            |
+//|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v1.7"
+#property copyright "SMC Scalping Bot v1.8"
 #property link      ""
-#property version   "1.70"
+#property version   "1.80"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -125,8 +125,12 @@ input group "=== Frequency Boost (Tiered RELAX) ==="
 input int      InpTargetTradesPerDay = 3;             // Soft target trades/day (2-3)
 input int      InpMaxTradesPerDay    = 30;            // Hard cap trades/day
 input int      InpMinMinutesBetweenTrades = 15;       // Min minutes between trades (cooldown)
-input int      InpNoTradeStartHHMM   = 2355;          // No-trade zone start (HHMM) - rollover
-input int      InpNoTradeEndHHMM     = 10;            // No-trade zone end (HHMM) - rollover
+
+input group "=== No-Trade Zone (Rollover Quarantine) ==="
+input int      InpNoTradeStartHHMM   = 2300;          // No-trade zone start (HHMM) - default 23:00
+input int      InpNoTradeEndHHMM     = 20;            // No-trade zone end (HHMM) - default 00:20
+input bool     InpBlockAllModesInNoTrade = true;      // Block ALL modes in no-trade zone
+input int      InpHardBlockAfterHHMM = 2300;          // Hard block after this time (HHMM) - no new orders
 
 input group "=== RELAX Mode ==="
 input bool     InpEnableRelaxMode    = true;          // Enable RELAX mode
@@ -138,7 +142,7 @@ input int      InpRelaxSweepBreakPoints = 15;         // RELAX sweep break point
 input int      InpRelaxRollingLiqBars   = 48;         // RELAX rolling liquidity bars (default 48)
 
 input group "=== RELAX2 Mode (End of Day) ==="
-input bool     InpEnableRelax2       = true;          // Enable RELAX2 mode
+input bool     InpEnableRelax2       = false;         // Enable RELAX2 mode (default OFF for safety)
 input int      InpRelax2Hour         = 21;            // Switch to RELAX2 after this hour
 input double   InpRelax2LotFactor    = 0.3;           // RELAX2 lot factor (more reduced)
 input int      InpRelax2SweepBreakPoints = 12;        // RELAX2 sweep break points
@@ -352,7 +356,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v1.7 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v1.8 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -1623,18 +1627,26 @@ void CheckTradeResult()
 //+------------------------------------------------------------------+
 bool PassRiskChecks()
 {
+   int currentHHMM = GetCurrentHHMM();
+   
+   // Check hard block first (after InpHardBlockAfterHHMM)
+   if(IsHardBlockTime())
+   {
+      LogNoTradeZoneCancel("hard_block_after", currentHHMM);
+      return false;
+   }
+   
+   // Check no-trade zone (rollover quarantine)
+   if(InpBlockAllModesInNoTrade && IsInNoTradeZone())
+   {
+      LogNoTradeZoneCancel("no_trade_zone", currentHHMM);
+      return false;
+   }
+   
    // Time filter with RELAX mode support
    if(!CheckTradingTime())
    {
-      // Check if it's rollover zone for specific logging
-      if(IsInNoTradeZone())
-      {
-         LogCancelReason("rollover");
-      }
-      else
-      {
-         LogCancelReason("timefilter");
-      }
+      LogCancelReason("timefilter");
       return false;
    }
    
@@ -1684,12 +1696,15 @@ bool PassRiskChecks()
       return false;
    }
    
-   // Daily loss limit
-   double dailyLossLimit = g_dailyStartEquity * InpDailyLossLimitPct / 100.0;
-   if(g_dailyPnL <= -dailyLossLimit)
+   // Daily loss limit (skip if InpDailyLossLimitPct = 0, meaning disabled)
+   if(InpDailyLossLimitPct > 0)
    {
-      LogCancelReason("daily_loss");
-      return false;
+      double dailyLossLimit = g_dailyStartEquity * InpDailyLossLimitPct / 100.0;
+      if(g_dailyPnL <= -dailyLossLimit)
+      {
+         LogCancelReason("daily_loss");
+         return false;
+      }
    }
    
    // No overlapping positions
@@ -1747,18 +1762,27 @@ bool IsWithinTradingHours()
 }
 
 //+------------------------------------------------------------------+
-//| Check if in no-trade zone (rollover protection)                    |
+//| Get current HHMM from server time                                   |
 //+------------------------------------------------------------------+
-bool IsInNoTradeZone()
+int GetCurrentHHMM()
 {
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
-   int currentHHMM = dt.hour * 100 + dt.min;
+   return dt.hour * 100 + dt.min;
+}
+
+//+------------------------------------------------------------------+
+//| Check if in no-trade zone (rollover quarantine)                     |
+//| Blocks ALL modes when InpBlockAllModesInNoTrade = true              |
+//+------------------------------------------------------------------+
+bool IsInNoTradeZone()
+{
+   int currentHHMM = GetCurrentHHMM();
    
    // Handle rollover zone that spans midnight
    if(InpNoTradeStartHHMM > InpNoTradeEndHHMM)
    {
-      // Zone spans midnight (e.g., 2355 to 0010)
+      // Zone spans midnight (e.g., 2300 to 0020)
       return (currentHHMM >= InpNoTradeStartHHMM || currentHHMM <= InpNoTradeEndHHMM);
    }
    else
@@ -1769,12 +1793,32 @@ bool IsInNoTradeZone()
 }
 
 //+------------------------------------------------------------------+
+//| Check if hard block time (after InpHardBlockAfterHHMM)              |
+//| This blocks new orders after specified time regardless of mode     |
+//+------------------------------------------------------------------+
+bool IsHardBlockTime()
+{
+   int currentHHMM = GetCurrentHHMM();
+   
+   // Hard block after specified time until midnight
+   // e.g., InpHardBlockAfterHHMM = 2300 means block from 23:00 to 23:59
+   // No-trade zone handles 00:00 onwards
+   return (currentHHMM >= InpHardBlockAfterHHMM && currentHHMM < 2400);
+}
+
+//+------------------------------------------------------------------+
 //| Check trading time with RELAX mode support                         |
 //+------------------------------------------------------------------+
 bool CheckTradingTime()
 {
-   // Always block no-trade zone (rollover)
-   if(IsInNoTradeZone())
+   // Always block no-trade zone (rollover quarantine) for ALL modes
+   if(InpBlockAllModesInNoTrade && IsInNoTradeZone())
+   {
+      return false;
+   }
+   
+   // Hard block after specified time - blocks ALL modes
+   if(IsHardBlockTime())
    {
       return false;
    }
@@ -1785,8 +1829,8 @@ bool CheckTradingTime()
       return IsWithinTradingHours();
    }
    
-   // MODE_RELAX: check if we can ignore timefilter
-   if(g_tradeMode == MODE_RELAX && InpRelaxIgnoreTimeFilter)
+   // MODE_RELAX/RELAX2: check if we can ignore timefilter
+   if((g_tradeMode == MODE_RELAX || g_tradeMode == MODE_RELAX2) && InpRelaxIgnoreTimeFilter)
    {
       // Only ignore timefilter if below target
       if(g_tradesToday < InpTargetTradesPerDay)
@@ -2262,6 +2306,34 @@ void CheckDealForSLHit(ulong dealTicket)
       Print("=== DAILY STOP TRIGGERED ===");
       Print("Max SL hits (", InpMaxSLHitsPerDay, ") reached. Trading blocked for today.");
    }
+}
+
+//+------------------------------------------------------------------+
+//| Log no-trade zone cancel (throttled)                                |
+//+------------------------------------------------------------------+
+void LogNoTradeZoneCancel(string reason, int currentHHMM)
+{
+   if(!InpEnableLogging) return;
+   
+   // Throttle to 60 seconds
+   static datetime lastNoTradeLog = 0;
+   static string lastNoTradeReason = "";
+   
+   if(reason == lastNoTradeReason && TimeCurrent() - lastNoTradeLog < 60)
+   {
+      g_lastCancelReason = reason;
+      g_lastCancelTime = TimeCurrent();
+      return;
+   }
+   
+   lastNoTradeLog = TimeCurrent();
+   lastNoTradeReason = reason;
+   g_lastCancelReason = reason;
+   g_lastCancelTime = TimeCurrent();
+   
+   // Detailed log format
+   Print(StringFormat("[CANCEL] reason=%s hhmm=%04d start=%04d end=%04d",
+                      reason, currentHHMM, InpNoTradeStartHHMM, InpNoTradeEndHHMM));
 }
 
 //+------------------------------------------------------------------+
@@ -2823,14 +2895,23 @@ void UpdatePanel()
    // Last cancel reason
    string cancelStr = g_lastCancelReason;
    if(cancelStr == "") cancelStr = "-";
-   color cancelColor = (cancelStr == "spread" || cancelStr == "spread_spike") ? clrYellow : clrGray;
+   color cancelColor = clrGray;
+   if(cancelStr == "spread" || cancelStr == "spread_spike") cancelColor = clrYellow;
+   if(cancelStr == "no_trade_zone" || cancelStr == "hard_block_after") cancelColor = clrRed;
    CreateLabel(panelName + "11", x, y + lineHeight*11, "LastCancel: " + cancelStr, cancelColor);
    
-   // Switch hour info (show tiered hours)
+   // No-trade zone status
+   int currentHHMM = GetCurrentHHMM();
+   bool inNoTrade = IsInNoTradeZone() || IsHardBlockTime();
+   string noTradeStr = inNoTrade ? StringFormat("ON (%04d)", currentHHMM) : "OFF";
+   color noTradeColor = inNoTrade ? clrRed : clrLime;
+   CreateLabel(panelName + "12", x, y + lineHeight*12, "NoTradeZone: " + noTradeStr, noTradeColor);
+   
+   // Switch hour info (show tiered hours and hard block)
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
-   string switchInfo = StringFormat("R@%d R2@%d (Now:%d)", InpRelaxSwitchHour, InpRelax2Hour, dt.hour);
-   CreateLabel(panelName + "12", x, y + lineHeight*12, switchInfo, clrGray);
+   string switchInfo = StringFormat("R@%d R2@%d Block@%04d (Now:%d)", InpRelaxSwitchHour, InpRelax2Hour, InpHardBlockAfterHHMM, dt.hour);
+   CreateLabel(panelName + "13", x, y + lineHeight*13, switchInfo, clrGray);
 }
 
 //+------------------------------------------------------------------+
