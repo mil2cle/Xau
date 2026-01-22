@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v1.2                         |
+//|                    SMC Scalping Bot v1.3                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v1.2"
+#property copyright "SMC Scalping Bot v1.3"
 #property link      ""
-#property version   "1.20"
+#property version   "1.30"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -102,6 +102,11 @@ input int      InpMaxTradesPerDay   = 6;              // Max trades per day
 input int      InpMaxConsecLosses   = 3;              // Max consecutive losses
 input double   InpDailyLossLimitPct = 2.0;            // Daily loss limit (%)
 
+input group "=== SL Hit Protection ==="
+input long     InpMagic             = 202601;         // Magic number for EA
+input int      InpMaxSLHitsPerDay   = 3;              // Max SL hits per day
+input bool     InpStopTradingOnSLHits = true;         // Stop trading after max SL hits
+
 input group "=== Time Filter ==="
 input string   InpTradeStart        = "14:00";        // Trade start time (server)
 input string   InpTradeEnd          = "23:30";        // Trade end time (server)
@@ -197,6 +202,12 @@ int            g_emaHandle = INVALID_HANDLE;
 string         g_biasNoneReason = "";
 bool           g_tradingWithBiasNone = false;
 
+// SL Hit tracking (daily)
+int            g_slHitsToday = 0;
+bool           g_blockedToday = false;
+int            g_dayKeyYYYYMMDD = 0;
+ulong          g_countedPositionIds[];
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
 //+------------------------------------------------------------------+
@@ -224,8 +235,8 @@ int OnInit()
    
    Print("Trading symbol resolved: ", tradeSym);
    
-   // Initialize trade object
-   trade.SetExpertMagicNumber(123456);
+   // Initialize trade object with user-defined magic
+   trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(10);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
    
@@ -234,6 +245,9 @@ int OnInit()
    
    // Initialize daily tracking
    ResetDailyCounters();
+   
+   // Initialize SL hit tracking
+   DailyResetIfNeeded();
    
    // Initialize logging
    if(InpEnableLogging)
@@ -259,9 +273,10 @@ int OnInit()
    // Initial calculations
    CalculateLiquidityLevels();
    
-   Print("SMC Scalping Bot v1.2 initialized on ", tradeSym);
-   Print("Bias Mode: ", EnumToString(InpBiasMode), " | Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
-   Print("Allow Bias None: ", InpAllowBiasNone, " | Require Bias: ", InpRequireBias);
+   Print("SMC Scalping Bot v1.3 initialized on ", tradeSym);
+   Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
+   Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
+   Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
    
    return(INIT_SUCCEEDED);
 }
@@ -304,8 +319,15 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Check for new day
+   // Check for new day and reset SL hit counter
    CheckNewDay();
+   DailyResetIfNeeded();
+   
+   // Check if blocked due to SL hits
+   if(g_blockedToday && InpStopTradingOnSLHits)
+   {
+      return;  // Stop all trading activity for today
+   }
    
    // Update liquidity levels periodically
    static datetime lastLiqUpdate = 0;
@@ -376,12 +398,16 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
+   // Check for daily reset first
+   DailyResetIfNeeded();
+   
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
       // A deal was added - check if it's ours
       if(trans.symbol == tradeSym)
       {
-         // Will be handled in ManageTrade
+         // Check for SL hit
+         CheckDealForSLHit(trans.deal);
       }
    }
 }
@@ -1653,6 +1679,125 @@ double CalculateLot()
    return NormalizeDouble(lot, 2);
 }
 
+//=== SL HIT TRACKING ===
+//+------------------------------------------------------------------+
+//| Get current day key as YYYYMMDD integer                            |
+//+------------------------------------------------------------------+
+int GetDayKeyYYYYMMDD()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   return dt.year * 10000 + dt.mon * 100 + dt.day;
+}
+
+//+------------------------------------------------------------------+
+//| Check if position ID already counted today                         |
+//+------------------------------------------------------------------+
+bool IsPositionIdCounted(ulong positionId)
+{
+   for(int i = 0; i < ArraySize(g_countedPositionIds); i++)
+   {
+      if(g_countedPositionIds[i] == positionId)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Add position ID to counted list                                    |
+//+------------------------------------------------------------------+
+void AddCountedPositionId(ulong positionId)
+{
+   int size = ArraySize(g_countedPositionIds);
+   ArrayResize(g_countedPositionIds, size + 1);
+   g_countedPositionIds[size] = positionId;
+}
+
+//+------------------------------------------------------------------+
+//| Daily reset if needed (call in OnTick and OnTradeTransaction)      |
+//+------------------------------------------------------------------+
+void DailyResetIfNeeded()
+{
+   int currentDayKey = GetDayKeyYYYYMMDD();
+   
+   if(currentDayKey != g_dayKeyYYYYMMDD)
+   {
+      // New day detected - reset all counters
+      g_dayKeyYYYYMMDD = currentDayKey;
+      g_slHitsToday = 0;
+      g_blockedToday = false;
+      ArrayResize(g_countedPositionIds, 0);
+      
+      Print("=== DAILY RESET ===");
+      Print("Date: ", currentDayKey, " | SL Hits reset to 0 | Trading enabled");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check deal for SL hit                                              |
+//+------------------------------------------------------------------+
+void CheckDealForSLHit(ulong dealTicket)
+{
+   if(dealTicket == 0) return;
+   
+   // Select deal from history
+   if(!HistoryDealSelect(dealTicket))
+   {
+      // Try selecting history for today
+      datetime dayStart = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+      HistorySelect(dayStart, TimeCurrent() + 3600);
+      if(!HistoryDealSelect(dealTicket))
+         return;
+   }
+   
+   // Check if it's an exit deal (DEAL_ENTRY_OUT)
+   ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+   if(dealEntry != DEAL_ENTRY_OUT)
+      return;
+   
+   // Check symbol
+   string dealSymbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+   if(dealSymbol != tradeSym)
+      return;
+   
+   // Check magic number
+   long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+   if(dealMagic != InpMagic)
+      return;
+   
+   // Check if reason is SL
+   ENUM_DEAL_REASON dealReason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
+   if(dealReason != DEAL_REASON_SL)
+      return;
+   
+   // Get position ID for deduplication
+   ulong positionId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+   
+   // Check if already counted (prevent partial fill double counting)
+   if(IsPositionIdCounted(positionId))
+      return;
+   
+   // Count this SL hit
+   AddCountedPositionId(positionId);
+   g_slHitsToday++;
+   
+   double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+   double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+   
+   Print("=== SL HIT COUNTED ===");
+   Print("Deal: ", dealTicket, " | Position: ", positionId);
+   Print("Volume: ", dealVolume, " | Profit: ", dealProfit);
+   Print("SL Hits Today: ", g_slHitsToday, "/", InpMaxSLHitsPerDay);
+   
+   // Check if max SL hits reached
+   if(g_slHitsToday >= InpMaxSLHitsPerDay && InpStopTradingOnSLHits)
+   {
+      g_blockedToday = true;
+      Print("=== DAILY STOP TRIGGERED ===");
+      Print("Max SL hits (", InpMaxSLHitsPerDay, ") reached. Trading blocked for today.");
+   }
+}
+
 //=== UTILITY FUNCTIONS ===
 //+------------------------------------------------------------------+
 //| Get spread in points                                               |
@@ -1953,7 +2098,7 @@ void UpdatePanel()
    string panelName = g_objPrefix + "Panel";
    
    // Delete old labels
-   for(int i = 0; i < 10; i++)
+   for(int i = 0; i < 12; i++)
    {
       ObjectDelete(0, panelName + IntegerToString(i));
    }
@@ -1961,7 +2106,7 @@ void UpdatePanel()
    int x = 10, y = 30, lineHeight = 18;
    color textColor = clrWhite;
    
-   // Panel background
+   // Panel background - increased height for new fields
    string bgName = panelName + "BG";
    if(ObjectFind(0, bgName) < 0)
    {
@@ -1970,13 +2115,13 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x - 5);
    ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, y - 5);
    ObjectSetInteger(0, bgName, OBJPROP_XSIZE, 200);
-   ObjectSetInteger(0, bgName, OBJPROP_YSIZE, lineHeight * 9);
+   ObjectSetInteger(0, bgName, OBJPROP_YSIZE, lineHeight * 11);
    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, clrDarkSlateGray);
    ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.0", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.3", textColor);
    CreateLabel(panelName + "1", x, y + lineHeight, "State: " + GetStateString(), textColor);
    CreateLabel(panelName + "2", x, y + lineHeight*2, "Bias: " + EnumToString(g_bias), textColor);
    CreateLabel(panelName + "3", x, y + lineHeight*3, StringFormat("Spread: %.1f pts", GetSpreadPoints()), 
@@ -1989,6 +2134,15 @@ void UpdatePanel()
    double dailyPct = (g_dailyStartEquity > 0) ? (g_dailyPnL / g_dailyStartEquity * 100) : 0;
    CreateLabel(panelName + "7", x, y + lineHeight*7, StringFormat("Daily PnL: %.2f%%", dailyPct), 
                dailyPct < 0 ? clrRed : clrLime);
+   
+   // SL Hits display
+   CreateLabel(panelName + "8", x, y + lineHeight*8, StringFormat("SL Hits: %d/%d", g_slHitsToday, InpMaxSLHitsPerDay),
+               g_slHitsToday >= InpMaxSLHitsPerDay ? clrRed : textColor);
+   
+   // Blocked status
+   string blockedStr = g_blockedToday ? "YES" : "NO";
+   CreateLabel(panelName + "9", x, y + lineHeight*9, "Blocked: " + blockedStr,
+               g_blockedToday ? clrRed : clrLime);
 }
 
 //+------------------------------------------------------------------+
