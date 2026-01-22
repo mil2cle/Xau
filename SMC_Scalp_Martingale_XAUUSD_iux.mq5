@@ -584,7 +584,8 @@ void CalculateLiquidityLevels()
    CalculateEqualHighsLows();
    
    // Store swing levels - use appropriate swing K based on mode
-   int swingK = (g_tradeMode == MODE_RELAX) ? g_relaxSwingK : InpSwingK;
+   // RELAX/RELAX2 use smaller swing K (1) for internal structure detection
+   int swingK = (g_tradeMode == MODE_STRICT) ? InpSwingK : 1;
    DetectSwings(InpEntryTF, g_m5SwingHighs, g_m5SwingLows, g_m5SwingHighBars, g_m5SwingLowBars, 100);
    DetectSwings(InpBiasTF, g_m15SwingHighs, g_m15SwingLows, g_m15SwingHighBars, g_m15SwingLowBars, 100);
 }
