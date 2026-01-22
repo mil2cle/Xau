@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v1.6                         |
+//|                    SMC Scalping Bot v1.7                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
-//|                    + Tiered RELAX (STRICT/RELAX/RELAX2)          |
+//|                    + Mode-Based Spread + Spike Filter            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v1.6"
+#property copyright "SMC Scalping Bot v1.7"
 #property link      ""
-#property version   "1.60"
+#property version   "1.70"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -104,10 +104,17 @@ input int      InpSLBufferPoints    = 40;             // SL buffer min (points)
 input double   InpPartialClosePercent = 50.0;         // Partial close % at TP1/1R
 
 input group "=== Risk Guardrails ==="
-input int      InpSpreadMax         = 30;             // Max spread (points)
 input int      InpCooldownBars      = 3;              // Cooldown bars after close
 input int      InpMaxConsecLosses   = 3;              // Max consecutive losses
 input double   InpDailyLossLimitPct = 2.0;            // Daily loss limit (%)
+
+input group "=== Spread Filter (Mode-Based) ==="
+input int      InpMaxSpreadStrict   = 45;             // Max spread STRICT mode (points)
+input int      InpMaxSpreadRelax    = 70;             // Max spread RELAX/RELAX2 mode (points)
+input int      InpMaxSpreadRollover = 30;             // Max spread near rollover (points)
+input int      InpSpreadSpikeWindowSec = 60;          // Spread spike window (seconds)
+input double   InpSpreadSpikeMultiplier = 2.0;        // Spread spike multiplier (cur > avg*mult = cancel)
+input int      InpLogSpreadCancelEverySec = 60;       // Log spread cancel throttle (seconds)
 
 input group "=== SL Hit Protection ==="
 input long     InpMagic             = 202601;         // Magic number for EA
@@ -251,6 +258,19 @@ ENUM_TRADE_MODE g_prevTradeMode = MODE_STRICT;
 double         g_rollingHigh = 0;
 double         g_rollingLow = 0;
 
+// Spread Spike Filter (rolling average)
+double         g_spreadHistory[];          // Rolling spread history
+datetime       g_spreadTimeHistory[];      // Timestamps for spread history
+int            g_spreadHistoryIdx = 0;     // Current index in circular buffer
+int            g_spreadHistorySize = 120;  // Max samples (2 per second for 60 sec)
+double         g_avgSpread = 0;            // Current rolling average spread
+double         g_currentSpread = 0;        // Current spread for display
+int            g_currentSpreadLimit = 0;   // Current spread limit for display
+
+// Last cancel reason for panel display
+string         g_lastCancelReason = "";
+datetime       g_lastCancelTime = 0;
+
 // Note: RELAX mode parameters are now controlled via input parameters
 // InpRelaxSweepBreakPoints, InpRelaxRollingLiqBars, InpRelax2SweepBreakPoints, etc.
 
@@ -317,6 +337,14 @@ int OnInit()
    g_tradeMode = MODE_STRICT;
    g_prevTradeMode = MODE_STRICT;
    
+   // Initialize spread history for spike detection
+   ArrayResize(g_spreadHistory, g_spreadHistorySize);
+   ArrayResize(g_spreadTimeHistory, g_spreadHistorySize);
+   ArrayInitialize(g_spreadHistory, 0);
+   ArrayInitialize(g_spreadTimeHistory, 0);
+   g_spreadHistoryIdx = 0;
+   g_avgSpread = 0;
+   
    // Set timer for periodic updates
    EventSetTimer(1);
    
@@ -324,7 +352,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v1.6 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v1.7 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -332,6 +360,7 @@ int OnInit()
    Print("RELAX: ", InpEnableRelaxMode, " @", InpRelaxSwitchHour, ":00 | Sweep: ", InpRelaxSweepBreakPoints, "pts | RollingLiq: ", InpRelaxRollingLiqBars, "bars");
    Print("RELAX2: ", InpEnableRelax2, " @", InpRelax2Hour, ":00 | Sweep: ", InpRelax2SweepBreakPoints, "pts | RollingLiq: ", InpRelax2RollingLiqBars, "bars");
    Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Martingale STRICT only: ", InpMartingaleStrictOnly);
+   Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
    
    return(INIT_SUCCEEDED);
 }
@@ -1620,11 +1649,24 @@ bool PassRiskChecks()
       }
    }
    
-   // Spread check
+   // Update spread history for spike detection
    double spreadPoints = GetSpreadPoints();
-   if(spreadPoints > InpSpreadMax)
+   UpdateSpreadHistory(spreadPoints);
+   
+   // Get mode-based spread limit
+   int spreadLimit = GetCurrentSpreadLimit();
+   
+   // Spread check (mode-based limit)
+   if(spreadPoints > spreadLimit)
    {
-      LogCancelReason(StringFormat("spread_%.1f", spreadPoints));
+      LogSpreadCancel("spread", spreadPoints, g_avgSpread, spreadLimit);
+      return false;
+   }
+   
+   // Spread spike check (sudden increase)
+   if(IsSpreadSpiking(spreadPoints))
+   {
+      LogSpreadCancel("spread_spike", spreadPoints, g_avgSpread, spreadLimit);
       return false;
    }
    
@@ -2223,10 +2265,51 @@ void CheckDealForSLHit(ulong dealTicket)
 }
 
 //+------------------------------------------------------------------+
+//| Log spread cancel with details (throttled)                         |
+//+------------------------------------------------------------------+
+void LogSpreadCancel(string reason, double curSpread, double avgSpread, int limit)
+{
+   if(!InpEnableLogging) return;
+   
+   // Throttle spread cancel logs using InpLogSpreadCancelEverySec
+   static datetime lastSpreadLog = 0;
+   static string lastSpreadReason = "";
+   
+   // Only log if different reason or enough time passed
+   if(reason == lastSpreadReason && TimeCurrent() - lastSpreadLog < InpLogSpreadCancelEverySec)
+   {
+      // Still update last cancel reason for panel
+      g_lastCancelReason = reason;
+      g_lastCancelTime = TimeCurrent();
+      return;
+   }
+   
+   lastSpreadLog = TimeCurrent();
+   lastSpreadReason = reason;
+   g_lastCancelReason = reason;
+   g_lastCancelTime = TimeCurrent();
+   
+   // Detailed log format
+   if(reason == "spread_spike")
+   {
+      Print(StringFormat("[CANCEL] reason=%s mode=%s cur=%.1f avg=%.1f limit=%d mult=%.1f",
+                         reason, EnumToString(g_tradeMode), curSpread, avgSpread, limit, InpSpreadSpikeMultiplier));
+   }
+   else
+   {
+      Print(StringFormat("[CANCEL] reason=%s mode=%s cur=%.1f avg=%.1f limit=%d",
+                         reason, EnumToString(g_tradeMode), curSpread, avgSpread, limit));
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Log cancel reason (short form)                                     |
 //+------------------------------------------------------------------+
 void LogCancelReason(string reason)
 {
+   // Update last cancel reason for panel
+   g_lastCancelReason = reason;
+   g_lastCancelTime = TimeCurrent();
    if(!InpEnableLogging) return;
    
    // Rate limit logging to avoid spam
@@ -2264,7 +2347,106 @@ double GetSpreadPoints()
 {
    double ask = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
    double bid = SymbolInfoDouble(tradeSym, SYMBOL_BID);
-   return (ask - bid) / _Point;
+   double spread = (ask - bid) / _Point;
+   
+   // Update spread for display
+   g_currentSpread = spread;
+   
+   return spread;
+}
+
+//+------------------------------------------------------------------+
+//| Update spread history for spike detection                          |
+//+------------------------------------------------------------------+
+void UpdateSpreadHistory(double spreadPoints)
+{
+   datetime now = TimeCurrent();
+   
+   // Add to circular buffer
+   g_spreadHistory[g_spreadHistoryIdx] = spreadPoints;
+   g_spreadTimeHistory[g_spreadHistoryIdx] = now;
+   g_spreadHistoryIdx = (g_spreadHistoryIdx + 1) % g_spreadHistorySize;
+   
+   // Calculate rolling average within window
+   double sum = 0;
+   int count = 0;
+   datetime windowStart = now - InpSpreadSpikeWindowSec;
+   
+   for(int i = 0; i < g_spreadHistorySize; i++)
+   {
+      if(g_spreadTimeHistory[i] >= windowStart && g_spreadHistory[i] > 0)
+      {
+         sum += g_spreadHistory[i];
+         count++;
+      }
+   }
+   
+   if(count > 0)
+      g_avgSpread = sum / count;
+   else
+      g_avgSpread = spreadPoints;  // First sample
+}
+
+//+------------------------------------------------------------------+
+//| Check if spread is spiking                                         |
+//+------------------------------------------------------------------+
+bool IsSpreadSpiking(double currentSpread)
+{
+   if(g_avgSpread <= 0) return false;
+   
+   // Spike if current > avg * multiplier
+   return (currentSpread > g_avgSpread * InpSpreadSpikeMultiplier);
+}
+
+//+------------------------------------------------------------------+
+//| Check if near rollover zone (extended)                             |
+//+------------------------------------------------------------------+
+bool IsNearRollover()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int currentHHMM = dt.hour * 100 + dt.min;
+   
+   // Extended rollover zone: 23:50 - 00:20
+   // This is wider than the no-trade zone to apply stricter spread limits
+   if(currentHHMM >= 2350 || currentHHMM <= 20)
+      return true;
+   
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Get current spread limit based on mode and time                    |
+//+------------------------------------------------------------------+
+int GetCurrentSpreadLimit()
+{
+   // Near rollover: use strictest limit
+   if(IsNearRollover())
+   {
+      g_currentSpreadLimit = InpMaxSpreadRollover;
+      return InpMaxSpreadRollover;
+   }
+   
+   // Based on trade mode
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX:
+      case MODE_RELAX2:
+         // RELAX modes: use relaxed limit only if below target
+         if(g_tradesToday < InpTargetTradesPerDay)
+         {
+            g_currentSpreadLimit = InpMaxSpreadRelax;
+            return InpMaxSpreadRelax;
+         }
+         // After reaching target, use strict limit
+         g_currentSpreadLimit = InpMaxSpreadStrict;
+         return InpMaxSpreadStrict;
+         
+      default:
+         // STRICT mode
+         g_currentSpreadLimit = InpMaxSpreadStrict;
+         return InpMaxSpreadStrict;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -2561,12 +2743,12 @@ void UpdatePanel()
    string panelName = g_objPrefix + "Panel";
    
    // Delete old labels
-   for(int i = 0; i < 14; i++)
+   for(int i = 0; i < 16; i++)
    {
       ObjectDelete(0, panelName + IntegerToString(i));
    }
    
-   int x = 10, y = 30, lineHeight = 18;
+   int x = 10, y = 30, lineHeight = 16;
    color textColor = clrWhite;
    
    // Panel background - increased height for new fields
@@ -2577,14 +2759,14 @@ void UpdatePanel()
    }
    ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x - 5);
    ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, y - 5);
-   ObjectSetInteger(0, bgName, OBJPROP_XSIZE, 250);
-   ObjectSetInteger(0, bgName, OBJPROP_YSIZE, lineHeight * 13);
+   ObjectSetInteger(0, bgName, OBJPROP_XSIZE, 290);
+   ObjectSetInteger(0, bgName, OBJPROP_YSIZE, lineHeight * 15);
    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, clrDarkSlateGray);
    ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.6", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.7", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
@@ -2608,8 +2790,13 @@ void UpdatePanel()
    
    CreateLabel(panelName + "2", x, y + lineHeight*2, "State: " + GetStateString(), textColor);
    CreateLabel(panelName + "3", x, y + lineHeight*3, "Bias: " + EnumToString(g_bias), textColor);
-   CreateLabel(panelName + "4", x, y + lineHeight*4, StringFormat("Spread: %.1f pts", GetSpreadPoints()), 
-               GetSpreadPoints() > InpSpreadMax ? clrRed : textColor);
+   
+   // Spread display with details: cur / avg / limit
+   int spreadLimit = GetCurrentSpreadLimit();
+   color spreadColor = (g_currentSpread > spreadLimit) ? clrRed : textColor;
+   CreateLabel(panelName + "4", x, y + lineHeight*4, 
+               StringFormat("Spread: %.1f/%.1f/%d (%s)", g_currentSpread, g_avgSpread, spreadLimit, modeStr), 
+               spreadColor);
    
    // Trades with target info
    CreateLabel(panelName + "5", x, y + lineHeight*5, 
@@ -2633,11 +2820,17 @@ void UpdatePanel()
    CreateLabel(panelName + "10", x, y + lineHeight*10, "Blocked: " + blockedStr,
                g_blockedToday ? clrRed : clrLime);
    
+   // Last cancel reason
+   string cancelStr = g_lastCancelReason;
+   if(cancelStr == "") cancelStr = "-";
+   color cancelColor = (cancelStr == "spread" || cancelStr == "spread_spike") ? clrYellow : clrGray;
+   CreateLabel(panelName + "11", x, y + lineHeight*11, "LastCancel: " + cancelStr, cancelColor);
+   
    // Switch hour info (show tiered hours)
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    string switchInfo = StringFormat("R@%d R2@%d (Now:%d)", InpRelaxSwitchHour, InpRelax2Hour, dt.hour);
-   CreateLabel(panelName + "11", x, y + lineHeight*11, switchInfo, clrGray);
+   CreateLabel(panelName + "12", x, y + lineHeight*12, switchInfo, clrGray);
 }
 
 //+------------------------------------------------------------------+
