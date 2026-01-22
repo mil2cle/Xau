@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v2.4                         |
+//|                    SMC Scalping Bot v2.5                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v2.4"
+#property copyright "SMC Scalping Bot v2.5"
 #property link      ""
-#property version   "2.40"
+#property version   "2.50"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -205,8 +205,10 @@ input int      InpRelax2ConfirmMaxBars   = 18;        // RELAX2 CHOCH confirm ma
 input int      InpRelax2EntryTimeoutBars = 50;        // RELAX2 entry timeout bars (slightly increased)
 input double   InpRelax2RetraceRatio     = 0.22;      // RELAX2 retrace ratio (0.20-0.25 range)
 input bool     InpRelax2AllowMicroChoch  = true;       // Allow micro CHOCH fallback in RELAX2
-input int      InpMicroChochMinBodyPts   = 30;         // Micro CHOCH min body size (points)
-input double   InpMicroChochATRFactor    = 0.3;        // Micro CHOCH min body as ATR factor
+input double   InpMicroChochStartPct     = 0.65;       // Start micro CHOCH at this % of window (0.65 = 65%)
+input int      InpMicroChochMinBodyPts   = 12;         // Micro CHOCH min body size (points) - reduced
+input double   InpMicroChochATRFactor    = 0.20;       // Micro CHOCH min body as ATR factor - reduced
+input int      InpMicroSwingLookback     = 2;          // Micro swing lookback bars (1-3)
 
 input group "=== Martingale ==="
 input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRICT mode
@@ -474,7 +476,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v2.4 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v2.5 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -483,7 +485,7 @@ int OnInit()
    Print("RELAX2: ", InpEnableRelax2, " @", InpRelax2Hour, ":00 | Sweep: ", InpRelax2SweepBreakPoints, "pts | SwingK: ", InpRelax2SwingK, " | ConfirmBars: ", InpRelax2ConfirmMaxBars);
    Print("ATR Sweep: ", InpUseATRSweepThreshold, " | Factor: ", InpSweepATRFactor, " | STRICT ConfirmBars: ", InpConfirmMaxBars);
    Print("2-Stage CHOCH: ", InpUse2StageChoch, " | Stage2 Confirm: ", InpStage2ConfirmBars, " bars");
-   Print("Micro CHOCH (RELAX2): ", InpRelax2AllowMicroChoch, " | MinBody: ", InpMicroChochMinBodyPts, "pts | ATR Factor: ", InpMicroChochATRFactor);
+   Print("Micro CHOCH (RELAX2): ", InpRelax2AllowMicroChoch, " | Start@", (int)(InpMicroChochStartPct*100), "% | MinBody: ", InpMicroChochMinBodyPts, "pts | ATR: ", InpMicroChochATRFactor, " | Lookback: ", InpMicroSwingLookback);
    Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Hard Block: ", InpEnableHardBlock ? StringFormat("%04d", InpHardBlockAfterHHMM) : "OFF");
    Print("24h Trading: ", InpEnable24hTrading, " | CSV Logging: ", InpEnableCSVLogging);
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
@@ -529,7 +531,7 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot v2.4 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v2.5 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -1178,25 +1180,23 @@ void LookForChoCH()
       return;
    }
    
-   // Check if we should try micro CHOCH fallback (RELAX2 only, near timeout)
+   // Check if we should try micro CHOCH fallback (RELAX2 only)
+   // Start considering micro CHOCH at InpMicroChochStartPct of window (e.g., 65% = bar 12 of 18)
    bool tryMicroChoch = false;
-   if(g_tradeMode == MODE_RELAX2 && InpRelax2AllowMicroChoch && barsSinceSweep >= (confirmMaxBars - 2))
+   int microChochStartBar = (int)(confirmMaxBars * InpMicroChochStartPct);
+   if(g_tradeMode == MODE_RELAX2 && InpRelax2AllowMicroChoch && barsSinceSweep >= microChochStartBar)
    {
       tryMicroChoch = true;
+      // Try micro CHOCH every bar from start point onwards
+      if(TryMicroChochFallback())
+      {
+         // Micro CHOCH succeeded
+         return;
+      }
    }
    
    if(barsSinceSweep > confirmMaxBars)
    {
-      // Before giving up, try micro CHOCH fallback for RELAX2
-      if(g_tradeMode == MODE_RELAX2 && InpRelax2AllowMicroChoch)
-      {
-         if(TryMicroChochFallback())
-         {
-            // Micro CHOCH succeeded, don't timeout
-            return;
-         }
-      }
-      
       LogSetup("WAIT_CHOCH", "timeout", g_bias, true, false, ZONE_NONE, 0, 0, 0);
       RecordCancel(CANCEL_CHOCH_TIMEOUT);
       ResetSetup();
@@ -1337,7 +1337,8 @@ void LookForChoCH()
 
 //+------------------------------------------------------------------+
 //| Try micro CHOCH fallback for RELAX2 mode                           |
-//| Uses smaller swing lookback and requires displacement candle       |
+//| Uses smaller swing lookback with relaxed requirements              |
+//| Guard: body >= min(InpMicroChochMinBodyPts, ATR*factor) - OR logic |
 //+------------------------------------------------------------------+
 bool TryMicroChochFallback()
 {
@@ -1351,57 +1352,80 @@ bool TryMicroChochFallback()
    double bodySize = MathAbs(close - open);
    int bodyPoints = (int)(bodySize / _Point);
    
-   // Check minimum body size (either fixed points or ATR-based)
-   int minBodyPts = InpMicroChochMinBodyPts;
+   // Check minimum body size using OR logic (either fixed OR ATR-based)
+   // This is more relaxed than AND logic
+   int fixedMinBody = InpMicroChochMinBodyPts;
+   int atrMinBody = 0;
    if(g_currentATR > 0)
    {
-      int atrBodyPts = (int)(g_currentATR * InpMicroChochATRFactor / _Point);
-      minBodyPts = MathMax(minBodyPts, atrBodyPts);
+      atrMinBody = (int)(g_currentATR * InpMicroChochATRFactor / _Point);
    }
    
-   if(bodyPoints < minBodyPts)
-   {
-      return false; // Body too small for micro CHOCH
-   }
+   // Use minimum of the two (OR logic = easier to pass)
+   int minBodyPts = (atrMinBody > 0) ? MathMin(fixedMinBody, atrMinBody) : fixedMinBody;
    
+   // Ensure minimum is at least 8 points for safety
+   minBodyPts = MathMax(minBodyPts, 8);
+   
+   bool bodyOK = (bodyPoints >= minBodyPts);
    bool isBullishCandle = (close > open);
+   bool isBearishCandle = (close < open);
+   
+   // For micro CHOCH, we're more relaxed on candle direction
+   // Just need the break to happen in correct direction
    bool microChochOK = false;
    double microLevel = 0;
+   int lookback = MathMax(1, MathMin(3, InpMicroSwingLookback));
    
-   if(g_sweepType == SWEEP_BULLISH && isBullishCandle)
+   if(g_sweepType == SWEEP_BULLISH)
    {
-      // For bullish sweep, need bullish displacement candle
-      // Use last 3 bars to find a micro swing high
+      // For bullish sweep, look for break above micro swing high
+      // Find micro swing high from last N bars
       double microSwingHigh = 0;
-      for(int i = 1; i <= 3; i++)
+      for(int i = 1; i <= lookback; i++)
       {
          double h = iHigh(tradeSym, InpEntryTF, i);
          if(h > microSwingHigh) microSwingHigh = h;
       }
       
       // Check if current bar breaks above micro swing
-      if(microSwingHigh > 0 && (high > microSwingHigh || close > microSwingHigh))
+      // Relaxed: accept wick break OR close break
+      // Body check is optional if we have strong break
+      bool hasBreak = (microSwingHigh > 0 && (high > microSwingHigh || close > microSwingHigh));
+      
+      if(hasBreak)
       {
-         microChochOK = true;
-         microLevel = microSwingHigh;
+         // Either body is OK, OR we have a bullish candle (relaxed)
+         if(bodyOK || isBullishCandle)
+         {
+            microChochOK = true;
+            microLevel = microSwingHigh;
+         }
       }
    }
-   else if(g_sweepType == SWEEP_BEARISH && !isBullishCandle)
+   else if(g_sweepType == SWEEP_BEARISH)
    {
-      // For bearish sweep, need bearish displacement candle
-      // Use last 3 bars to find a micro swing low
+      // For bearish sweep, look for break below micro swing low
+      // Find micro swing low from last N bars
       double microSwingLow = DBL_MAX;
-      for(int i = 1; i <= 3; i++)
+      for(int i = 1; i <= lookback; i++)
       {
          double l = iLow(tradeSym, InpEntryTF, i);
          if(l < microSwingLow) microSwingLow = l;
       }
       
       // Check if current bar breaks below micro swing
-      if(microSwingLow < DBL_MAX && (low < microSwingLow || close < microSwingLow))
+      // Relaxed: accept wick break OR close break
+      bool hasBreak = (microSwingLow < DBL_MAX && (low < microSwingLow || close < microSwingLow));
+      
+      if(hasBreak)
       {
-         microChochOK = true;
-         microLevel = microSwingLow;
+         // Either body is OK, OR we have a bearish candle (relaxed)
+         if(bodyOK || isBearishCandle)
+         {
+            microChochOK = true;
+            microLevel = microSwingLow;
+         }
       }
    }
    
@@ -1422,7 +1446,7 @@ bool TryMicroChochFallback()
       // Record that micro CHOCH was used (info counter, not cancel)
       RecordCancel(INFO_MICROCHOCH_USED);
       
-      Print("MICRO CHOCH fallback used at ", microLevel, " | Body: ", bodyPoints, "pts | MinBody: ", minBodyPts, "pts");
+      Print("MICRO CHOCH used at ", microLevel, " | Body: ", bodyPoints, "pts (min: ", minBodyPts, ") | Lookback: ", lookback, " | Sweep: ", EnumToString(g_sweepType));
       return true;
    }
    
@@ -3616,7 +3640,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.4", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.5", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
