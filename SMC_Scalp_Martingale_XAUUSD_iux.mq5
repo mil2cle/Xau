@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v1.5                         |
+//|                    SMC Scalping Bot v1.6                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
-//|                    + Frequency Boost + RELAX TimeFilter          |
+//|                    + Tiered RELAX (STRICT/RELAX/RELAX2)          |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v1.5"
+#property copyright "SMC Scalping Bot v1.6"
 #property link      ""
-#property version   "1.50"
+#property version   "1.60"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -74,7 +74,8 @@ enum ENUM_BIAS_MODE
 enum ENUM_TRADE_MODE
 {
    MODE_STRICT,              // Normal mode with full requirements
-   MODE_RELAX                // Relaxed mode with easier entry conditions
+   MODE_RELAX,               // Relaxed mode with easier entry conditions
+   MODE_RELAX2               // Final relaxed mode (end of day)
 };
 
 //=== INPUT PARAMETERS ===
@@ -113,17 +114,32 @@ input long     InpMagic             = 202601;         // Magic number for EA
 input int      InpMaxSLHitsPerDay   = 3;              // Max SL hits per day
 input bool     InpStopTradingOnSLHits = true;         // Stop trading after max SL hits
 
-input group "=== Frequency Boost (STRICT/RELAX) ==="
+input group "=== Frequency Boost (Tiered RELAX) ==="
 input int      InpTargetTradesPerDay = 3;             // Soft target trades/day (2-3)
 input int      InpMaxTradesPerDay    = 30;            // Hard cap trades/day
-input int      InpRelaxSwitchHour    = 18;            // Switch to RELAX after this hour
-input bool     InpEnableRelaxMode    = true;          // Enable RELAX mode
-input double   InpRelaxLotFactor     = 0.5;           // RELAX lot factor (reduce lot)
-input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRICT mode
-input bool     InpRelaxAllowBiasNone = true;          // RELAX allows bias=none
-input bool     InpRelaxIgnoreTimeFilter = true;       // RELAX ignores timefilter when below target
+input int      InpMinMinutesBetweenTrades = 15;       // Min minutes between trades (cooldown)
 input int      InpNoTradeStartHHMM   = 2355;          // No-trade zone start (HHMM) - rollover
 input int      InpNoTradeEndHHMM     = 10;            // No-trade zone end (HHMM) - rollover
+
+input group "=== RELAX Mode ==="
+input bool     InpEnableRelaxMode    = true;          // Enable RELAX mode
+input int      InpRelaxSwitchHour    = 16;            // Switch to RELAX after this hour
+input double   InpRelaxLotFactor     = 0.5;           // RELAX lot factor (reduce lot)
+input bool     InpRelaxAllowBiasNone = true;          // RELAX allows bias=none
+input bool     InpRelaxIgnoreTimeFilter = true;       // RELAX ignores timefilter when below target
+input int      InpRelaxSweepBreakPoints = 15;         // RELAX sweep break points (default 15)
+input int      InpRelaxRollingLiqBars   = 48;         // RELAX rolling liquidity bars (default 48)
+
+input group "=== RELAX2 Mode (End of Day) ==="
+input bool     InpEnableRelax2       = true;          // Enable RELAX2 mode
+input int      InpRelax2Hour         = 21;            // Switch to RELAX2 after this hour
+input double   InpRelax2LotFactor    = 0.3;           // RELAX2 lot factor (more reduced)
+input int      InpRelax2SweepBreakPoints = 12;        // RELAX2 sweep break points
+input int      InpRelax2RollingLiqBars   = 36;        // RELAX2 rolling liquidity bars
+input bool     InpRelax2AllowBiasNone    = true;      // RELAX2 allows bias=none
+
+input group "=== Martingale ==="
+input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRICT mode
 
 input group "=== Time Filter ==="
 input string   InpTradeStart        = "14:00";        // Trade start time (server)
@@ -193,6 +209,7 @@ double         g_dailyStartEquity = 0;
 double         g_dailyPnL = 0;
 int            g_cooldownCounter = 0;
 datetime       g_lastTradeDay = 0;
+datetime       g_lastTradeTime = 0;        // Time of last trade (for cooldown)
 
 // Martingale
 int            g_martLevel = 0;
@@ -233,14 +250,9 @@ ENUM_TRADE_MODE g_prevTradeMode = MODE_STRICT;
 // Rolling liquidity for RELAX mode
 double         g_rollingHigh = 0;
 double         g_rollingLow = 0;
-int            g_rollingBars = 96;  // 8 hours on M5
 
-// RELAX mode parameters (adjusted from STRICT)
-int            g_relaxSweepBreakPoints = 20;    // vs 30 in STRICT
-int            g_relaxReclaimMaxBars = 3;       // vs 2 in STRICT
-int            g_relaxConfirmMaxBars = 10;      // vs 6 in STRICT
-int            g_relaxEntryTimeoutBars = 20;    // vs 10 in STRICT
-int            g_relaxSwingK = 1;               // vs 2 in STRICT (internal structure)
+// Note: RELAX mode parameters are now controlled via input parameters
+// InpRelaxSweepBreakPoints, InpRelaxRollingLiqBars, InpRelax2SweepBreakPoints, etc.
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -312,13 +324,14 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v1.5 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v1.6 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
-   Print("Target Trades: ", InpTargetTradesPerDay, " | Max Trades: ", InpMaxTradesPerDay);
-   Print("RELAX Mode: ", InpEnableRelaxMode, " | Switch Hour: ", InpRelaxSwitchHour);
-   Print("RELAX Ignore TimeFilter: ", InpRelaxIgnoreTimeFilter, " | NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM);
+   Print("Target Trades: ", InpTargetTradesPerDay, " | Max Trades: ", InpMaxTradesPerDay, " | Cooldown: ", InpMinMinutesBetweenTrades, "m");
+   Print("RELAX: ", InpEnableRelaxMode, " @", InpRelaxSwitchHour, ":00 | Sweep: ", InpRelaxSweepBreakPoints, "pts | RollingLiq: ", InpRelaxRollingLiqBars, "bars");
+   Print("RELAX2: ", InpEnableRelax2, " @", InpRelax2Hour, ":00 | Sweep: ", InpRelax2SweepBreakPoints, "pts | RollingLiq: ", InpRelax2RollingLiqBars, "bars");
+   Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Martingale STRICT only: ", InpMartingaleStrictOnly);
    
    return(INIT_SUCCEEDED);
 }
@@ -584,7 +597,9 @@ void CalculateRollingLiquidity()
    g_rollingHigh = 0;
    g_rollingLow = DBL_MAX;
    
-   int barsToCheck = MathMin(g_rollingBars, iBars(tradeSym, InpEntryTF));
+   // Use mode-based rolling bars
+   int rollingBars = GetRollingLiqBars();
+   int barsToCheck = MathMin(rollingBars, iBars(tradeSym, InpEntryTF));
    
    for(int i = 0; i < barsToCheck; i++)
    {
@@ -1290,10 +1305,11 @@ void PlaceOrder()
       g_entryPrice = price;
       g_partialClosed = false;
       g_tradesToday++;
+      g_lastTradeTime = TimeCurrent();  // Update last trade time for cooldown
       g_state = STATE_MANAGE_TRADE;
       
       Print("Order placed: ", EnumToString(orderType), " Lot: ", g_currentLot, 
-            " Entry: ", price, " SL: ", sl, " TP1: ", tp);
+            " Entry: ", price, " SL: ", sl, " TP1: ", tp, " Mode: ", EnumToString(g_tradeMode));
       
       // Log setup success
       double distToTP1 = MathAbs(tp - price) / _Point;
@@ -1592,6 +1608,17 @@ bool PassRiskChecks()
       return false;
    }
    
+   // Cooldown between trades
+   if(g_lastTradeTime > 0 && InpMinMinutesBetweenTrades > 0)
+   {
+      int minutesSinceLastTrade = (int)((TimeCurrent() - g_lastTradeTime) / 60);
+      if(minutesSinceLastTrade < InpMinMinutesBetweenTrades)
+      {
+         LogCancelReason(StringFormat("cooldown_%dm", InpMinMinutesBetweenTrades - minutesSinceLastTrade));
+         return false;
+      }
+   }
+   
    // Spread check
    double spreadPoints = GetSpreadPoints();
    if(spreadPoints > InpSpreadMax)
@@ -1854,9 +1881,9 @@ double CalculateLot()
 {
    double lot = InpBaseLot;
    
-   // In RELAX mode: no martingale if InpMartingaleStrictOnly is true
+   // In RELAX/RELAX2 mode: no martingale if InpMartingaleStrictOnly is true
    bool allowMartingale = true;
-   if(g_tradeMode == MODE_RELAX && InpMartingaleStrictOnly)
+   if((g_tradeMode == MODE_RELAX || g_tradeMode == MODE_RELAX2) && InpMartingaleStrictOnly)
    {
       allowMartingale = false;
    }
@@ -1877,18 +1904,20 @@ double CalculateLot()
    }
    else if(!allowMartingale && g_martLevel > 0)
    {
-      Print("Martingale disabled in RELAX mode. Using base lot.");
+      Print("Martingale disabled in ", EnumToString(g_tradeMode), ". Using base lot.");
       lot = InpBaseLot;
    }
    
-   // Apply RELAX lot factor
-   if(g_tradeMode == MODE_RELAX)
+   // Apply mode-based lot factor
+   double lotFactor = GetLotFactor();
+   if(lotFactor < 1.0)
    {
-      lot = lot * InpRelaxLotFactor;
-      Print("Applying RELAX lot factor: ", InpRelaxLotFactor, " -> Lot: ", lot);
+      lot = lot * lotFactor;
+      Print("Applying ", EnumToString(g_tradeMode), " lot factor: ", lotFactor, " -> Lot: ", lot);
    }
+   
    // Apply bias none lot factor if trading without bias (additional reduction)
-   else if(g_tradingWithBiasNone)
+   if(g_tradingWithBiasNone && g_tradeMode == MODE_STRICT)
    {
       lot = lot * InpBiasNoneLotFactor;
       Print("Applying BIAS_NONE lot factor: ", InpBiasNoneLotFactor, " -> Lot: ", lot);
@@ -1914,9 +1943,19 @@ double CalculateLot()
 //+------------------------------------------------------------------+
 void UpdateTradeMode()
 {
-   if(!InpEnableRelaxMode)
+   // Save previous mode for logging
+   g_prevTradeMode = g_tradeMode;
+   
+   // Default to STRICT
+   g_tradeMode = MODE_STRICT;
+   
+   // Check if below target
+   bool belowTarget = (g_tradesToday < InpTargetTradesPerDay);
+   
+   if(!belowTarget)
    {
-      g_tradeMode = MODE_STRICT;
+      // Already reached target - stay STRICT
+      if(g_tradeMode != g_prevTradeMode) LogModeChange();
       return;
    }
    
@@ -1924,18 +1963,18 @@ void UpdateTradeMode()
    TimeToStruct(TimeCurrent(), dt);
    int currentHour = dt.hour;
    
-   // Save previous mode for logging
-   g_prevTradeMode = g_tradeMode;
-   
-   // Switch logic: if past switch hour AND below target trades -> RELAX
-   if(currentHour >= InpRelaxSwitchHour && g_tradesToday < InpTargetTradesPerDay)
+   // Tiered RELAX logic:
+   // 1. Check RELAX2 first (higher priority if enabled and past hour)
+   if(InpEnableRelax2 && currentHour >= InpRelax2Hour)
+   {
+      g_tradeMode = MODE_RELAX2;
+   }
+   // 2. Check RELAX
+   else if(InpEnableRelaxMode && currentHour >= InpRelaxSwitchHour)
    {
       g_tradeMode = MODE_RELAX;
    }
-   else
-   {
-      g_tradeMode = MODE_STRICT;
-   }
+   // 3. Otherwise stay STRICT
    
    // Log mode change
    if(g_tradeMode != g_prevTradeMode)
@@ -1951,15 +1990,20 @@ void LogModeChange()
 {
    string reason = "";
    
-   if(g_tradeMode == MODE_RELAX)
+   switch(g_tradeMode)
    {
-      reason = StringFormat("Below target (%d/%d) after switch hour (%d:00)",
-                            g_tradesToday, InpTargetTradesPerDay, InpRelaxSwitchHour);
-   }
-   else
-   {
-      reason = StringFormat("Target reached (%d/%d) or before switch hour",
-                            g_tradesToday, InpTargetTradesPerDay);
+      case MODE_RELAX2:
+         reason = StringFormat("Below target (%d/%d) after RELAX2 hour (%d:00)",
+                               g_tradesToday, InpTargetTradesPerDay, InpRelax2Hour);
+         break;
+      case MODE_RELAX:
+         reason = StringFormat("Below target (%d/%d) after RELAX hour (%d:00)",
+                               g_tradesToday, InpTargetTradesPerDay, InpRelaxSwitchHour);
+         break;
+      default:
+         reason = StringFormat("Target reached (%d/%d) or before switch hours",
+                               g_tradesToday, InpTargetTradesPerDay);
+         break;
    }
    
    Print("=== MODE CHANGE ===");
@@ -1972,7 +2016,12 @@ void LogModeChange()
 //+------------------------------------------------------------------+
 int GetSweepBreakPoints()
 {
-   return (g_tradeMode == MODE_RELAX) ? g_relaxSweepBreakPoints : InpSweepBreakPoints;
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return InpRelax2SweepBreakPoints;
+      case MODE_RELAX:  return InpRelaxSweepBreakPoints;
+      default:          return InpSweepBreakPoints;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1980,7 +2029,12 @@ int GetSweepBreakPoints()
 //+------------------------------------------------------------------+
 int GetReclaimMaxBars()
 {
-   return (g_tradeMode == MODE_RELAX) ? g_relaxReclaimMaxBars : InpReclaimMaxBars;
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return 4;   // More relaxed
+      case MODE_RELAX:  return 3;   // Relaxed
+      default:          return InpReclaimMaxBars;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1988,7 +2042,12 @@ int GetReclaimMaxBars()
 //+------------------------------------------------------------------+
 int GetConfirmMaxBars()
 {
-   return (g_tradeMode == MODE_RELAX) ? g_relaxConfirmMaxBars : InpConfirmMaxBars;
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return 15;  // More relaxed
+      case MODE_RELAX:  return 10;  // Relaxed
+      default:          return InpConfirmMaxBars;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1996,7 +2055,25 @@ int GetConfirmMaxBars()
 //+------------------------------------------------------------------+
 int GetEntryTimeoutBars()
 {
-   return (g_tradeMode == MODE_RELAX) ? g_relaxEntryTimeoutBars : InpEntryTimeoutBars;
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return 30;  // More relaxed
+      case MODE_RELAX:  return 20;  // Relaxed
+      default:          return InpEntryTimeoutBars;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get rolling liquidity bars based on mode                           |
+//+------------------------------------------------------------------+
+int GetRollingLiqBars()
+{
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return InpRelax2RollingLiqBars;
+      case MODE_RELAX:  return InpRelaxRollingLiqBars;
+      default:          return 96;  // Default for STRICT (not used)
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -2004,9 +2081,25 @@ int GetEntryTimeoutBars()
 //+------------------------------------------------------------------+
 bool IsBiasNoneAllowed()
 {
-   if(g_tradeMode == MODE_RELAX && InpRelaxAllowBiasNone)
-      return true;
-   return InpAllowBiasNone;
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return InpRelax2AllowBiasNone;
+      case MODE_RELAX:  return InpRelaxAllowBiasNone;
+      default:          return InpAllowBiasNone;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get lot factor based on mode                                       |
+//+------------------------------------------------------------------+
+double GetLotFactor()
+{
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return InpRelax2LotFactor;
+      case MODE_RELAX:  return InpRelaxLotFactor;
+      default:          return 1.0;
+   }
 }
 
 //=== SL HIT TRACKING ===
@@ -2483,18 +2576,33 @@ void UpdatePanel()
    }
    ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x - 5);
    ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, y - 5);
-   ObjectSetInteger(0, bgName, OBJPROP_XSIZE, 230);
+   ObjectSetInteger(0, bgName, OBJPROP_XSIZE, 250);
    ObjectSetInteger(0, bgName, OBJPROP_YSIZE, lineHeight * 13);
    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, clrDarkSlateGray);
    ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.5", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.6", textColor);
    
-   // Trade Mode display with color
-   string modeStr = (g_tradeMode == MODE_STRICT) ? "STRICT" : "RELAX";
-   color modeColor = (g_tradeMode == MODE_STRICT) ? clrLime : clrYellow;
+   // Trade Mode display with color (Tiered RELAX)
+   string modeStr;
+   color modeColor;
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2:
+         modeStr = "RELAX2";
+         modeColor = clrOrange;
+         break;
+      case MODE_RELAX:
+         modeStr = "RELAX";
+         modeColor = clrYellow;
+         break;
+      default:
+         modeStr = "STRICT";
+         modeColor = clrLime;
+         break;
+   }
    CreateLabel(panelName + "1", x, y + lineHeight, "Mode: " + modeStr, modeColor);
    
    CreateLabel(panelName + "2", x, y + lineHeight*2, "State: " + GetStateString(), textColor);
@@ -2524,10 +2632,10 @@ void UpdatePanel()
    CreateLabel(panelName + "10", x, y + lineHeight*10, "Blocked: " + blockedStr,
                g_blockedToday ? clrRed : clrLime);
    
-   // Switch hour info
+   // Switch hour info (show tiered hours)
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
-   string switchInfo = StringFormat("Switch@%d:00 (Now:%d)", InpRelaxSwitchHour, dt.hour);
+   string switchInfo = StringFormat("R@%d R2@%d (Now:%d)", InpRelaxSwitchHour, InpRelax2Hour, dt.hour);
    CreateLabel(panelName + "11", x, y + lineHeight*11, switchInfo, clrGray);
 }
 
