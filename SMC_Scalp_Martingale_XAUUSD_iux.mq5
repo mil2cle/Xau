@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v1.1                         |
+//|                    SMC Scalping Bot v1.2                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v1.1"
+#property copyright "SMC Scalping Bot v1.2"
 #property link      ""
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -64,11 +64,24 @@ enum ENUM_MARTINGALE_MODE
    MART_SCALE_IN      // stub for future
 };
 
+enum ENUM_BIAS_MODE
+{
+   BIAS_MODE_STRUCTURE_M15,  // Structure-based (swing high/low)
+   BIAS_MODE_EMA200_M15      // EMA200-based
+};
+
 //=== INPUT PARAMETERS ===
 input group "=== Symbol & Timeframe ==="
 input string   InpTradeSymbol       = "";             // Symbol (empty = use chart symbol)
 input ENUM_TIMEFRAMES InpBiasTF     = PERIOD_M15;     // Bias Timeframe
 input ENUM_TIMEFRAMES InpEntryTF    = PERIOD_M5;      // Entry Timeframe
+
+input group "=== Bias Settings ==="
+input ENUM_BIAS_MODE InpBiasMode    = BIAS_MODE_EMA200_M15; // Bias detection mode
+input bool     InpRequireBias       = true;           // Require bias for entry (strict)
+input bool     InpAllowBiasNone     = false;          // Allow trade when bias=none (reduced lot)
+input double   InpBiasNoneLotFactor = 0.5;            // Lot factor when bias=none (0.5 = 50%)
+input int      InpEMAPeriod         = 200;            // EMA period for bias
 
 input group "=== SMC Parameters ==="
 input int      InpSwingK            = 2;              // Swing lookback (fractal)
@@ -179,6 +192,11 @@ int            g_m15SwingLowBars[];
 // Visual objects
 string         g_objPrefix = "SMC_";
 
+// Bias tracking
+int            g_emaHandle = INVALID_HANDLE;
+string         g_biasNoneReason = "";
+bool           g_tradingWithBiasNone = false;
+
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
 //+------------------------------------------------------------------+
@@ -223,14 +241,27 @@ int OnInit()
       InitLogging();
    }
    
+   // Initialize EMA for bias detection
+   if(InpBiasMode == BIAS_MODE_EMA200_M15)
+   {
+      g_emaHandle = iMA(tradeSym, InpBiasTF, InpEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      if(g_emaHandle == INVALID_HANDLE)
+      {
+         Print("Error creating EMA indicator: ", GetLastError());
+         return(INIT_FAILED);
+      }
+      Print("EMA", InpEMAPeriod, " initialized for bias detection");
+   }
+   
    // Set timer for periodic updates
    EventSetTimer(1);
    
    // Initial calculations
    CalculateLiquidityLevels();
    
-   Print("SMC Scalping Bot v1.0 initialized on ", tradeSym);
-   Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
+   Print("SMC Scalping Bot v1.2 initialized on ", tradeSym);
+   Print("Bias Mode: ", EnumToString(InpBiasMode), " | Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
+   Print("Allow Bias None: ", InpAllowBiasNone, " | Require Bias: ", InpRequireBias);
    
    return(INIT_SUCCEEDED);
 }
@@ -241,6 +272,10 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   
+   // Release EMA indicator
+   if(g_emaHandle != INVALID_HANDLE)
+      IndicatorRelease(g_emaHandle);
    
    // Close log files
    if(g_tradesFileHandle != INVALID_HANDLE)
@@ -562,9 +597,28 @@ void LookForSweep()
 {
    // Get bias first
    g_bias = GetBias();
+   g_tradingWithBiasNone = false;  // Reset flag
    
+   // Handle BIAS_NONE cases
    if(g_bias == BIAS_NONE)
    {
+      // If strict bias required and no AllowBiasNone, skip
+      if(InpRequireBias && !InpAllowBiasNone)
+      {
+         LogSetup("WAIT_SWEEP", "nobias_strict", g_bias, false, false, ZONE_NONE, 0, 0, 0);
+         return;
+      }
+      
+      // If AllowBiasNone is true, we can still trade but with reduced lot
+      if(InpAllowBiasNone)
+      {
+         g_tradingWithBiasNone = true;
+         Print("Trading with BIAS_NONE (reduced lot). Reason: ", g_biasNoneReason);
+         // Look for both directions when bias is none
+         LookForSweepBothDirections();
+         return;
+      }
+      
       LogSetup("WAIT_SWEEP", "nobias", g_bias, false, false, ZONE_NONE, 0, 0, 0);
       return;
    }
@@ -579,7 +633,7 @@ void LookForSweep()
       {
          g_sweepType = SWEEP_BULLISH;
          g_state = STATE_WAIT_CHOCH;
-         Print("Sweep DOWN detected at ", g_sweepLevel, " (", EnumToString(g_sweepLiqType), ")");
+         Print("Sweep DOWN detected at ", g_sweepLevel, " (", EnumToString(g_sweepLiqType), ") [Bias: BULLISH]");
       }
    }
    else if(g_bias == BIAS_BEARISH)
@@ -589,8 +643,34 @@ void LookForSweep()
       {
          g_sweepType = SWEEP_BEARISH;
          g_state = STATE_WAIT_CHOCH;
-         Print("Sweep UP detected at ", g_sweepLevel, " (", EnumToString(g_sweepLiqType), ")");
+         Print("Sweep UP detected at ", g_sweepLevel, " (", EnumToString(g_sweepLiqType), ") [Bias: BEARISH]");
       }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Look for sweep in both directions (when bias is none)              |
+//+------------------------------------------------------------------+
+void LookForSweepBothDirections()
+{
+   double sweepBreak = MathMax(InpSweepBreakPoints, (int)MathCeil(2 * GetSpreadPoints())) * _Point;
+   
+   // Try sweep down first (for potential long)
+   if(CheckSweepDown(sweepBreak))
+   {
+      g_sweepType = SWEEP_BULLISH;
+      g_state = STATE_WAIT_CHOCH;
+      Print("Sweep DOWN detected at ", g_sweepLevel, " (", EnumToString(g_sweepLiqType), ") [Bias: NONE - reduced lot]");
+      return;
+   }
+   
+   // Try sweep up (for potential short)
+   if(CheckSweepUp(sweepBreak))
+   {
+      g_sweepType = SWEEP_BEARISH;
+      g_state = STATE_WAIT_CHOCH;
+      Print("Sweep UP detected at ", g_sweepLevel, " (", EnumToString(g_sweepLiqType), ") [Bias: NONE - reduced lot]");
+      return;
    }
 }
 
@@ -1412,9 +1492,66 @@ bool IsWithinTradingHours()
 }
 
 //+------------------------------------------------------------------+
-//| Get bias from M15                                                  |
+//| Get bias from M15 (supports multiple modes)                        |
 //+------------------------------------------------------------------+
 ENUM_BIAS GetBias()
+{
+   g_biasNoneReason = "";  // Reset reason
+   
+   if(InpBiasMode == BIAS_MODE_EMA200_M15)
+   {
+      return GetBiasEMA();
+   }
+   else
+   {
+      return GetBiasStructure();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get bias using EMA200 method                                       |
+//+------------------------------------------------------------------+
+ENUM_BIAS GetBiasEMA()
+{
+   if(g_emaHandle == INVALID_HANDLE)
+   {
+      g_biasNoneReason = "EMA handle invalid";
+      LogBiasNone(g_biasNoneReason);
+      return BIAS_NONE;
+   }
+   
+   double emaValue[];
+   ArraySetAsSeries(emaValue, true);
+   
+   if(CopyBuffer(g_emaHandle, 0, 0, 1, emaValue) <= 0)
+   {
+      g_biasNoneReason = "Failed to copy EMA buffer";
+      LogBiasNone(g_biasNoneReason);
+      return BIAS_NONE;
+   }
+   
+   double close = iClose(tradeSym, InpBiasTF, 0);
+   double ema = emaValue[0];
+   
+   // Clear bias determination
+   if(close > ema)
+   {
+      return BIAS_BULLISH;
+   }
+   else if(close < ema)
+   {
+      return BIAS_BEARISH;
+   }
+   
+   g_biasNoneReason = "Price exactly at EMA (ambiguous)";
+   LogBiasNone(g_biasNoneReason);
+   return BIAS_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Get bias using Structure method (original)                         |
+//+------------------------------------------------------------------+
+ENUM_BIAS GetBiasStructure()
 {
    int barIndex;
    double close = iClose(tradeSym, InpBiasTF, 0);
@@ -1422,13 +1559,54 @@ ENUM_BIAS GetBias()
    double minorSwingHigh = GetLatestMinorSwingHigh(InpBiasTF, barIndex);
    double minorSwingLow = GetLatestMinorSwingLow(InpBiasTF, barIndex);
    
+   // Check for no swing detection
+   if(minorSwingHigh <= 0 && minorSwingLow <= 0)
+   {
+      g_biasNoneReason = "No swing points detected (not enough bars)";
+      LogBiasNone(g_biasNoneReason);
+      return BIAS_NONE;
+   }
+   
+   if(minorSwingHigh <= 0)
+   {
+      g_biasNoneReason = "No swing high detected";
+      LogBiasNone(g_biasNoneReason);
+   }
+   
+   if(minorSwingLow <= 0)
+   {
+      g_biasNoneReason = "No swing low detected";
+      LogBiasNone(g_biasNoneReason);
+   }
+   
+   // Bullish: close above swing high
    if(minorSwingHigh > 0 && close > minorSwingHigh)
       return BIAS_BULLISH;
    
+   // Bearish: close below swing low
    if(minorSwingLow > 0 && close < minorSwingLow)
       return BIAS_BEARISH;
    
+   // Ambiguous: price between swing high and low
+   g_biasNoneReason = StringFormat("Ambiguous: Close %.2f between SwingLow %.2f and SwingHigh %.2f",
+                                    close, minorSwingLow, minorSwingHigh);
+   LogBiasNone(g_biasNoneReason);
    return BIAS_NONE;
+}
+
+//+------------------------------------------------------------------+
+//| Log bias none reason                                               |
+//+------------------------------------------------------------------+
+void LogBiasNone(string reason)
+{
+   if(!InpEnableLogging) return;
+   
+   static datetime lastLogTime = 0;
+   // Limit logging to once per minute to avoid spam
+   if(TimeCurrent() - lastLogTime < 60) return;
+   lastLogTime = TimeCurrent();
+   
+   Print("Bias NONE: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -1438,9 +1616,27 @@ double CalculateLot()
 {
    double lot = InpBaseLot;
    
+   // Apply martingale only if NOT trading with bias none
+   // When bias is none, martingale is disabled for safety
    if(InpMartingaleMode == MART_AFTER_LOSS && g_martLevel > 0)
    {
-      lot = InpBaseLot * MathPow(InpMartMultiplier, g_martLevel);
+      if(g_tradingWithBiasNone)
+      {
+         // Martingale disabled when trading with bias none
+         Print("Martingale disabled for BIAS_NONE trade. Using base lot.");
+         lot = InpBaseLot;
+      }
+      else
+      {
+         lot = InpBaseLot * MathPow(InpMartMultiplier, g_martLevel);
+      }
+   }
+   
+   // Apply bias none lot factor if trading without bias
+   if(g_tradingWithBiasNone)
+   {
+      lot = lot * InpBiasNoneLotFactor;
+      Print("Applying BIAS_NONE lot factor: ", InpBiasNoneLotFactor, " -> Lot: ", lot);
    }
    
    // Apply cap
