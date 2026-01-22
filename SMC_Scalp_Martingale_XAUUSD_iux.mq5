@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v2.0                         |
+//|                    SMC Scalping Bot v2.1                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v2.0"
+#property copyright "SMC Scalping Bot v2.1"
 #property link      ""
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -95,8 +95,18 @@ enum ENUM_CANCEL_REASON
    CANCEL_MAX_TRADES_DAY,
    CANCEL_CONSECUTIVE_LOSSES,
    CANCEL_DAILY_LOSS,
-   CANCEL_OTHER,
-   CANCEL_COUNT              // Total count of reasons
+   CANCEL_ROLLOVER,
+   CANCEL_ATR_LOW,
+   CANCEL_SWEEP_TIMEOUT,
+   CANCEL_CHOCH_TIMEOUT,
+   CANCEL_RETRACE_TIMEOUT,
+   CANCEL_COUNT              // Total count of reasons (removed OTHER)
+};
+
+enum ENUM_CHOCH_MODE
+{
+   CHOCH_CLOSE_ONLY,         // CHOCH requires close beyond level (strict)
+   CHOCH_WICK_OK             // CHOCH allows wick beyond level (relaxed)
 };
 
 //=== INPUT PARAMETERS ===
@@ -112,13 +122,23 @@ input bool     InpAllowBiasNone     = false;          // Allow trade when bias=n
 input double   InpBiasNoneLotFactor = 0.5;            // Lot factor when bias=none (0.5 = 50%)
 input int      InpEMAPeriod         = 200;            // EMA period for bias
 
-input group "=== SMC Parameters ==="
+input group "=== SMC Parameters (STRICT) ==="
 input int      InpSwingK            = 2;              // Swing lookback (fractal)
 input int      InpEqThresholdPoints = 80;             // EQH/EQL threshold (points)
 input int      InpReclaimMaxBars    = 2;              // Reclaim max bars after sweep
-input int      InpSweepBreakPoints  = 30;             // Min sweep break (points)
-input int      InpConfirmMaxBars    = 6;              // CHOCH confirm max bars
-input int      InpEntryTimeoutBars  = 10;             // Entry timeout bars
+input int      InpSweepBreakPoints  = 30;             // Min sweep break (points) - STRICT
+input int      InpConfirmMaxBars    = 6;              // CHOCH confirm max bars - STRICT
+input int      InpEntryTimeoutBars  = 10;             // Entry timeout bars - STRICT
+input double   InpRetraceRatio      = 0.50;           // Retrace ratio - STRICT (0.50 = 50%)
+
+input group "=== ATR-Adaptive Sweep ==="
+input bool     InpUseATRSweepThreshold = true;        // Use ATR-adaptive sweep threshold
+input double   InpSweepATRFactor    = 0.3;            // ATR factor for sweep (0.3 = 30% of ATR)
+input int      InpATRPeriod         = 14;             // ATR period
+
+input group "=== CHOCH Mode ==="
+input ENUM_CHOCH_MODE InpChochModeStrict = CHOCH_CLOSE_ONLY;  // CHOCH mode STRICT
+input ENUM_CHOCH_MODE InpChochModeRelax  = CHOCH_WICK_OK;     // CHOCH mode RELAX/RELAX2
 
 input group "=== SL/TP Parameters ==="
 input int      InpSLBufferPoints    = 40;             // SL buffer min (points)
@@ -160,16 +180,24 @@ input int      InpRelaxSwitchHour    = 15;            // Switch to RELAX after t
 input double   InpRelaxLotFactor     = 0.5;           // RELAX lot factor (reduce lot)
 input bool     InpRelaxAllowBiasNone = true;          // RELAX allows bias=none
 input bool     InpRelaxIgnoreTimeFilter = true;       // RELAX ignores timefilter when below target
-input int      InpRelaxSweepBreakPoints = 12;         // RELAX sweep break points (reduced from 15)
-input int      InpRelaxRollingLiqBars   = 36;         // RELAX rolling liquidity bars (reduced from 48)
+input int      InpRelaxSweepBreakPoints = 10;         // RELAX sweep break points (reduced)
+input int      InpRelaxRollingLiqBars   = 36;         // RELAX rolling liquidity bars
+input int      InpRelaxReclaimMaxBars   = 3;          // RELAX reclaim max bars (increased)
+input int      InpRelaxConfirmMaxBars   = 10;         // RELAX CHOCH confirm max bars (increased)
+input int      InpRelaxEntryTimeoutBars = 20;         // RELAX entry timeout bars (increased)
+input double   InpRelaxRetraceRatio     = 0.35;       // RELAX retrace ratio (0.35 = 35%)
 
 input group "=== RELAX2 Mode (End of Day) ==="
 input bool     InpEnableRelax2       = true;          // Enable RELAX2 mode (ON for more frequency)
 input int      InpRelax2Hour         = 20;            // Switch to RELAX2 after this hour (earlier)
 input double   InpRelax2LotFactor    = 0.3;           // RELAX2 lot factor (more reduced)
-input int      InpRelax2SweepBreakPoints = 10;        // RELAX2 sweep break points (reduced)
+input int      InpRelax2SweepBreakPoints = 8;         // RELAX2 sweep break points (reduced)
 input int      InpRelax2RollingLiqBars   = 24;        // RELAX2 rolling liquidity bars (reduced)
 input bool     InpRelax2AllowBiasNone    = true;      // RELAX2 allows bias=none
+input int      InpRelax2ReclaimMaxBars   = 4;         // RELAX2 reclaim max bars (more relaxed)
+input int      InpRelax2ConfirmMaxBars   = 15;        // RELAX2 CHOCH confirm max bars (more relaxed)
+input int      InpRelax2EntryTimeoutBars = 30;        // RELAX2 entry timeout bars (more relaxed)
+input double   InpRelax2RetraceRatio     = 0.25;      // RELAX2 retrace ratio (0.25 = 25%)
 
 input group "=== Martingale ==="
 input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRICT mode
@@ -274,6 +302,10 @@ string         g_objPrefix = "SMC_";
 int            g_emaHandle = INVALID_HANDLE;
 string         g_biasNoneReason = "";
 bool           g_tradingWithBiasNone = false;
+
+// ATR handle for adaptive sweep
+int            g_atrHandle = INVALID_HANDLE;
+double         g_currentATR = 0;
 
 // SL Hit tracking (daily)
 int            g_slHitsToday = 0;
@@ -381,6 +413,18 @@ int OnInit()
       Print("EMA", InpEMAPeriod, " initialized for bias detection");
    }
    
+   // Initialize ATR for adaptive sweep threshold
+   if(InpUseATRSweepThreshold)
+   {
+      g_atrHandle = iATR(tradeSym, InpEntryTF, InpATRPeriod);
+      if(g_atrHandle == INVALID_HANDLE)
+      {
+         Print("Error creating ATR indicator: ", GetLastError());
+         return(INIT_FAILED);
+      }
+      Print("ATR", InpATRPeriod, " initialized for adaptive sweep threshold");
+   }
+   
    // Initialize trade mode
    g_tradeMode = MODE_STRICT;
    g_prevTradeMode = MODE_STRICT;
@@ -416,7 +460,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v2.0 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v2.1 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -455,6 +499,10 @@ void OnDeinit(const int reason)
    if(g_emaHandle != INVALID_HANDLE)
       IndicatorRelease(g_emaHandle);
    
+   // Release ATR indicator
+   if(g_atrHandle != INVALID_HANDLE)
+      IndicatorRelease(g_atrHandle);
+   
    // Close log files
    if(g_tradesFileHandle != INVALID_HANDLE)
       FileClose(g_tradesFileHandle);
@@ -464,7 +512,7 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot v2.0 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v2.1 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -507,6 +555,7 @@ void OnTick()
    {
       CalculateLiquidityLevels();
       CalculateRollingLiquidity();
+      UpdateATR();  // Update ATR for adaptive sweep
       lastLiqUpdate = TimeCurrent();
    }
    
@@ -831,7 +880,7 @@ void LookForSweep()
       if(!IsBiasNoneAllowed())
       {
          LogSetup("WAIT_SWEEP", "nobias_strict", g_bias, false, false, ZONE_NONE, 0, 0, 0);
-         LogCancelReason("nobias");
+         RecordCancel(CANCEL_BIAS_NONE);
          return;
       }
       
@@ -859,7 +908,7 @@ void LookForSweep()
       }
       else
       {
-         LogCancelReason("no_sweep");
+         RecordCancel(CANCEL_NO_SWEEP);
       }
    }
    else if(g_bias == BIAS_BEARISH)
@@ -873,7 +922,7 @@ void LookForSweep()
       }
       else
       {
-         LogCancelReason("no_sweep");
+         RecordCancel(CANCEL_NO_SWEEP);
       }
    }
 }
@@ -904,7 +953,7 @@ void LookForSweepBothDirections()
       return;
    }
    
-   LogCancelReason("no_sweep");
+   RecordCancel(CANCEL_NO_SWEEP);
 }
 
 //+------------------------------------------------------------------+
@@ -1102,22 +1151,40 @@ void LookForChoCH()
    if(barsSinceSweep > confirmMaxBars)
    {
       LogSetup("WAIT_CHOCH", "timeout", g_bias, true, false, ZONE_NONE, 0, 0, 0);
-      LogCancelReason("no_choch");
+      RecordCancel(CANCEL_CHOCH_TIMEOUT);
       ResetSetup();
       return;
    }
+   
+   // Get CHOCH mode based on trade mode
+   ENUM_CHOCH_MODE chochMode = GetChochMode();
    
    int minorSwingBar;
    
    if(g_sweepType == SWEEP_BULLISH)
    {
-      // After sweep down, look for bullish CHOCH (close above minor swing high)
+      // After sweep down, look for bullish CHOCH
       double minorSwingHigh = GetLatestMinorSwingHigh(InpEntryTF, minorSwingBar);
       
       if(minorSwingHigh > 0 && minorSwingBar > 0)
       {
          double close = iClose(tradeSym, InpEntryTF, 0);
-         if(close > minorSwingHigh)
+         double high = iHigh(tradeSym, InpEntryTF, 0);
+         
+         bool chochConfirmed = false;
+         
+         if(chochMode == CHOCH_CLOSE_ONLY)
+         {
+            // STRICT: require close above level
+            chochConfirmed = (close > minorSwingHigh);
+         }
+         else // CHOCH_WICK_OK
+         {
+            // RELAX: allow wick above level (high > level)
+            chochConfirmed = (high > minorSwingHigh);
+         }
+         
+         if(chochConfirmed)
          {
             g_chochLevel = minorSwingHigh;
             g_chochBar = 0;
@@ -1126,19 +1193,34 @@ void LookForChoCH()
             // Build zones
             BuildZones(true);
             
-            Print("Bullish CHOCH confirmed at ", g_chochLevel);
+            Print("Bullish CHOCH confirmed at ", g_chochLevel, " (mode: ", EnumToString(chochMode), ")");
          }
       }
    }
    else if(g_sweepType == SWEEP_BEARISH)
    {
-      // After sweep up, look for bearish CHOCH (close below minor swing low)
+      // After sweep up, look for bearish CHOCH
       double minorSwingLow = GetLatestMinorSwingLow(InpEntryTF, minorSwingBar);
       
       if(minorSwingLow > 0 && minorSwingBar > 0)
       {
          double close = iClose(tradeSym, InpEntryTF, 0);
-         if(close < minorSwingLow)
+         double low = iLow(tradeSym, InpEntryTF, 0);
+         
+         bool chochConfirmed = false;
+         
+         if(chochMode == CHOCH_CLOSE_ONLY)
+         {
+            // STRICT: require close below level
+            chochConfirmed = (close < minorSwingLow);
+         }
+         else // CHOCH_WICK_OK
+         {
+            // RELAX: allow wick below level (low < level)
+            chochConfirmed = (low < minorSwingLow);
+         }
+         
+         if(chochConfirmed)
          {
             g_chochLevel = minorSwingLow;
             g_chochBar = 0;
@@ -1147,7 +1229,7 @@ void LookForChoCH()
             // Build zones
             BuildZones(false);
             
-            Print("Bearish CHOCH confirmed at ", g_chochLevel);
+            Print("Bearish CHOCH confirmed at ", g_chochLevel, " (mode: ", EnumToString(chochMode), ")");
          }
       }
    }
@@ -1295,13 +1377,16 @@ void LookForRetrace()
    if(g_zoneBar > entryTimeout)
    {
       LogSetup("WAIT_RETRACE", "timeout", g_bias, true, true, g_zoneType, g_zoneLow, g_zoneHigh, 0);
-      LogCancelReason("timeout");
+      RecordCancel(CANCEL_RETRACE_TIMEOUT);
       ResetSetup();
       return;
    }
    
    double bid = SymbolInfoDouble(tradeSym, SYMBOL_BID);
    double ask = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
+   
+   // Get retrace ratio based on mode
+   double retraceRatio = GetRetraceRatio();
    
    // Check if price is in zone
    bool inZone = false;
@@ -1313,15 +1398,15 @@ void LookForRetrace()
       {
          inZone = true;
       }
-      // RELAX mode: also allow 50% retrace of displacement
-      else if(g_tradeMode == MODE_RELAX && g_chochLevel > 0 && g_sweepLevel > 0)
+      // RELAX/RELAX2 mode: also allow retrace based on ratio
+      else if(g_tradeMode != MODE_STRICT && g_chochLevel > 0 && g_sweepLevel > 0)
       {
          double displacement = g_chochLevel - g_sweepLevel;
-         double retrace50 = g_chochLevel - (displacement * 0.5);
-         if(bid <= retrace50 && bid > g_sweepLevel)
+         double retraceLevel = g_chochLevel - (displacement * retraceRatio);
+         if(bid <= retraceLevel && bid > g_sweepLevel)
          {
             inZone = true;
-            Print("RELAX: 50%% retrace entry at ", bid);
+            Print(EnumToString(g_tradeMode), ": ", (int)(retraceRatio*100), "%% retrace entry at ", bid);
          }
       }
       
@@ -1338,15 +1423,15 @@ void LookForRetrace()
       {
          inZone = true;
       }
-      // RELAX mode: also allow 50% retrace of displacement
-      else if(g_tradeMode == MODE_RELAX && g_chochLevel > 0 && g_sweepLevel > 0)
+      // RELAX/RELAX2 mode: also allow retrace based on ratio
+      else if(g_tradeMode != MODE_STRICT && g_chochLevel > 0 && g_sweepLevel > 0)
       {
          double displacement = g_sweepLevel - g_chochLevel;
-         double retrace50 = g_chochLevel + (displacement * 0.5);
-         if(ask >= retrace50 && ask < g_sweepLevel)
+         double retraceLevel = g_chochLevel + (displacement * retraceRatio);
+         if(ask >= retraceLevel && ask < g_sweepLevel)
          {
             inZone = true;
-            Print("RELAX: 50%% retrace entry at ", ask);
+            Print(EnumToString(g_tradeMode), ": ", (int)(retraceRatio*100), "%% retrace entry at ", ask);
          }
       }
       
@@ -1359,7 +1444,7 @@ void LookForRetrace()
    
    if(!inZone)
    {
-      LogCancelReason("no_retrace");
+      RecordCancel(CANCEL_NO_RETRACE);
    }
 }
 
@@ -1707,31 +1792,28 @@ bool PassRiskChecks()
    // Check SL blocked first (highest priority)
    if(g_blockedToday && InpStopTradingOnSLHits)
    {
-      IncrementCancelCounter("sl_blocked");
+      RecordCancel(CANCEL_SL_BLOCKED);
       return false;
    }
    
    // Check hard block (after InpHardBlockAfterHHMM)
    if(IsHardBlockTime())
    {
-      LogNoTradeZoneCancel("hard_block_after", currentHHMM);
-      IncrementCancelCounter("hard_block");
+      RecordCancel(CANCEL_HARD_BLOCK);
       return false;
    }
    
    // Check no-trade zone (rollover quarantine)
    if(InpBlockAllModesInNoTrade && IsInNoTradeZone())
    {
-      LogNoTradeZoneCancel("no_trade_zone", currentHHMM);
-      IncrementCancelCounter("no_trade_zone");
+      RecordCancel(CANCEL_NO_TRADE_ZONE);
       return false;
    }
    
    // Time filter with RELAX mode support
    if(!CheckTradingTime())
    {
-      LogCancelReasonThrottled("timefilter");
-      IncrementCancelCounter("timefilter");
+      RecordCancel(CANCEL_TIMEFILTER);
       return false;
    }
    
@@ -1741,8 +1823,7 @@ bool PassRiskChecks()
       int minutesSinceLastTrade = (int)((TimeCurrent() - g_lastTradeTime) / 60);
       if(minutesSinceLastTrade < InpMinMinutesBetweenTrades)
       {
-         LogCancelReasonThrottled("cooldown");
-         IncrementCancelCounter("cooldown");
+         RecordCancel(CANCEL_COOLDOWN);
          return false;
       }
    }
@@ -1757,32 +1838,28 @@ bool PassRiskChecks()
    // Spread check (mode-based limit)
    if(spreadPoints > spreadLimit)
    {
-      LogSpreadCancel("spread", spreadPoints, g_avgSpread, spreadLimit);
-      IncrementCancelCounter("spread");
+      RecordCancel(CANCEL_SPREAD);
       return false;
    }
    
    // Spread spike check (sudden increase)
    if(IsSpreadSpiking(spreadPoints))
    {
-      LogSpreadCancel("spread_spike", spreadPoints, g_avgSpread, spreadLimit);
-      IncrementCancelCounter("spread_spike");
+      RecordCancel(CANCEL_SPREAD_SPIKE);
       return false;
    }
    
    // Max trades per day
    if(g_tradesToday >= InpMaxTradesPerDay)
    {
-      LogCancelReasonThrottled("max_trades");
-      IncrementCancelCounter("max_trades");
+      RecordCancel(CANCEL_MAX_TRADES_DAY);
       return false;
    }
    
    // Consecutive losses
    if(g_consecLosses >= InpMaxConsecLosses)
    {
-      LogCancelReasonThrottled("consec_losses");
-      IncrementCancelCounter("consec_losses");
+      RecordCancel(CANCEL_CONSECUTIVE_LOSSES);
       return false;
    }
    
@@ -1792,8 +1869,7 @@ bool PassRiskChecks()
       double dailyLossLimit = g_dailyStartEquity * InpDailyLossLimitPct / 100.0;
       if(g_dailyPnL <= -dailyLossLimit)
       {
-         LogCancelReasonThrottled("daily_loss");
-         IncrementCancelCounter("daily_loss");
+         RecordCancel(CANCEL_DAILY_LOSS);
          return false;
       }
    }
@@ -2211,16 +2287,45 @@ void LogModeChange()
 }
 
 //+------------------------------------------------------------------+
-//| Get current sweep break points based on mode                       |
+//| Update ATR value                                                    |
+//+------------------------------------------------------------------+
+void UpdateATR()
+{
+   if(!InpUseATRSweepThreshold || g_atrHandle == INVALID_HANDLE)
+   {
+      g_currentATR = 0;
+      return;
+   }
+   
+   double atrBuffer[];
+   if(CopyBuffer(g_atrHandle, 0, 0, 1, atrBuffer) > 0)
+   {
+      g_currentATR = atrBuffer[0];
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get current sweep break points based on mode (ATR-adaptive)        |
 //+------------------------------------------------------------------+
 int GetSweepBreakPoints()
 {
+   int staticPoints;
    switch(g_tradeMode)
    {
-      case MODE_RELAX2: return InpRelax2SweepBreakPoints;
-      case MODE_RELAX:  return InpRelaxSweepBreakPoints;
-      default:          return InpSweepBreakPoints;
+      case MODE_RELAX2: staticPoints = InpRelax2SweepBreakPoints; break;
+      case MODE_RELAX:  staticPoints = InpRelaxSweepBreakPoints; break;
+      default:          staticPoints = InpSweepBreakPoints; break;
    }
+   
+   // ATR-adaptive: use max of static and ATR-based
+   if(InpUseATRSweepThreshold && g_currentATR > 0)
+   {
+      // Convert ATR to points
+      int atrPoints = (int)(g_currentATR * InpSweepATRFactor / _Point);
+      return MathMax(staticPoints, atrPoints);
+   }
+   
+   return staticPoints;
 }
 
 //+------------------------------------------------------------------+
@@ -2230,8 +2335,8 @@ int GetReclaimMaxBars()
 {
    switch(g_tradeMode)
    {
-      case MODE_RELAX2: return 4;   // More relaxed
-      case MODE_RELAX:  return 3;   // Relaxed
+      case MODE_RELAX2: return InpRelax2ReclaimMaxBars;
+      case MODE_RELAX:  return InpRelaxReclaimMaxBars;
       default:          return InpReclaimMaxBars;
    }
 }
@@ -2243,8 +2348,8 @@ int GetConfirmMaxBars()
 {
    switch(g_tradeMode)
    {
-      case MODE_RELAX2: return 15;  // More relaxed
-      case MODE_RELAX:  return 10;  // Relaxed
+      case MODE_RELAX2: return InpRelax2ConfirmMaxBars;
+      case MODE_RELAX:  return InpRelaxConfirmMaxBars;
       default:          return InpConfirmMaxBars;
    }
 }
@@ -2256,9 +2361,35 @@ int GetEntryTimeoutBars()
 {
    switch(g_tradeMode)
    {
-      case MODE_RELAX2: return 30;  // More relaxed
-      case MODE_RELAX:  return 20;  // Relaxed
+      case MODE_RELAX2: return InpRelax2EntryTimeoutBars;
+      case MODE_RELAX:  return InpRelaxEntryTimeoutBars;
       default:          return InpEntryTimeoutBars;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get current retrace ratio based on mode                            |
+//+------------------------------------------------------------------+
+double GetRetraceRatio()
+{
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return InpRelax2RetraceRatio;
+      case MODE_RELAX:  return InpRelaxRetraceRatio;
+      default:          return InpRetraceRatio;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get current CHOCH mode based on trade mode                         |
+//+------------------------------------------------------------------+
+ENUM_CHOCH_MODE GetChochMode()
+{
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return InpChochModeRelax;
+      case MODE_RELAX:  return InpChochModeRelax;
+      default:          return InpChochModeStrict;
    }
 }
 
@@ -2507,7 +2638,11 @@ string GetCancelReasonName(ENUM_CANCEL_REASON reason)
       case CANCEL_MAX_TRADES_DAY:    return "max_trades";
       case CANCEL_CONSECUTIVE_LOSSES: return "consec_losses";
       case CANCEL_DAILY_LOSS:        return "daily_loss";
-      case CANCEL_OTHER:             return "other";
+      case CANCEL_ROLLOVER:          return "rollover";
+      case CANCEL_ATR_LOW:           return "atr_low";
+      case CANCEL_SWEEP_TIMEOUT:     return "sweep_timeout";
+      case CANCEL_CHOCH_TIMEOUT:     return "choch_timeout";
+      case CANCEL_RETRACE_TIMEOUT:   return "retrace_timeout";
       default:                       return "unknown";
    }
 }
@@ -2861,7 +2996,7 @@ void PrintFinalSummary()
    Print("Total SL hits: ", totalSL);
    Print("Total PnL: ", DoubleToString(totalPnL, 2));
    Print("");
-   Print("--- Top 5 Cancel Reasons (All Time) ---");
+   Print("--- Top 10 Cancel Reasons (All Time) ---");
    
    // Sort and print top 5 cancel reasons
    int sortedIdx[];
@@ -2892,15 +3027,19 @@ void PrintFinalSummary()
       }
    }
    
-   // Print top 5
-   for(int i = 0; i < 5 && i < CANCEL_COUNT; i++)
+   // Calculate total cancels for percentage
+   int totalCancels = 0;
+   for(int j = 0; j < CANCEL_COUNT; j++) totalCancels += finalCounters[j];
+   
+   Print("Total cancel events: ", totalCancels);
+   Print("");
+   
+   // Print top 10
+   for(int i = 0; i < 10 && i < CANCEL_COUNT; i++)
    {
       if(sortedCounts[i] > 0)
       {
-         double pct = 0;
-         int totalCancels = 0;
-         for(int j = 0; j < CANCEL_COUNT; j++) totalCancels += finalCounters[j];
-         if(totalCancels > 0) pct = (double)sortedCounts[i] / totalCancels * 100;
+         double pct = totalCancels > 0 ? (double)sortedCounts[i] / totalCancels * 100 : 0;
          
          Print("  ", i+1, ". ", GetCancelReasonName((ENUM_CANCEL_REASON)sortedIdx[i]), 
                ": ", sortedCounts[i], " (", DoubleToString(pct, 1), "%)");
