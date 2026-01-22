@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v2.1                         |
+//|                    SMC Scalping Bot v2.2                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v2.1"
+#property copyright "SMC Scalping Bot v2.2"
 #property link      ""
-#property version   "2.10"
+#property version   "2.20"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -128,13 +128,13 @@ input int      InpSwingK            = 2;              // Swing lookback (fractal
 input int      InpEqThresholdPoints = 80;             // EQH/EQL threshold (points)
 input int      InpReclaimMaxBars    = 2;              // Reclaim max bars after sweep
 input int      InpSweepBreakPoints  = 30;             // Min sweep break (points) - STRICT
-input int      InpConfirmMaxBars    = 6;              // CHOCH confirm max bars - STRICT
+input int      InpConfirmMaxBars    = 8;              // CHOCH confirm max bars - STRICT (increased)
 input int      InpEntryTimeoutBars  = 10;             // Entry timeout bars - STRICT
 input double   InpRetraceRatio      = 0.50;           // Retrace ratio - STRICT (0.50 = 50%)
 
 input group "=== ATR-Adaptive Sweep ==="
 input bool     InpUseATRSweepThreshold = true;        // Use ATR-adaptive sweep threshold
-input double   InpSweepATRFactor    = 0.3;            // ATR factor for sweep (0.3 = 30% of ATR)
+input double   InpSweepATRFactor    = 0.20;           // ATR factor for sweep (0.20 = 20% of ATR, lower = easier sweep)
 input int      InpATRPeriod         = 14;             // ATR period
 
 input group "=== CHOCH Mode ==="
@@ -181,24 +181,26 @@ input int      InpRelaxSwitchHour    = 15;            // Switch to RELAX after t
 input double   InpRelaxLotFactor     = 0.5;           // RELAX lot factor (reduce lot)
 input bool     InpRelaxAllowBiasNone = true;          // RELAX allows bias=none
 input bool     InpRelaxIgnoreTimeFilter = true;       // RELAX ignores timefilter when below target
-input int      InpRelaxSweepBreakPoints = 10;         // RELAX sweep break points (reduced)
+input int      InpRelaxSweepBreakPoints = 8;          // RELAX sweep break points (reduced more)
 input int      InpRelaxRollingLiqBars   = 36;         // RELAX rolling liquidity bars
 input int      InpRelaxReclaimMaxBars   = 3;          // RELAX reclaim max bars (increased)
-input int      InpRelaxConfirmMaxBars   = 10;         // RELAX CHOCH confirm max bars (increased)
-input int      InpRelaxEntryTimeoutBars = 20;         // RELAX entry timeout bars (increased)
-input double   InpRelaxRetraceRatio     = 0.35;       // RELAX retrace ratio (0.35 = 35%)
+input int      InpRelaxSwingK           = 1;          // RELAX swing lookback (1 = faster swing detection)
+input int      InpRelaxConfirmMaxBars   = 15;         // RELAX CHOCH confirm max bars (increased more)
+input int      InpRelaxEntryTimeoutBars = 30;         // RELAX entry timeout bars (increased more)
+input double   InpRelaxRetraceRatio     = 0.30;       // RELAX retrace ratio (0.30 = 30%, easier entry)
 
 input group "=== RELAX2 Mode (End of Day) ==="
 input bool     InpEnableRelax2       = true;          // Enable RELAX2 mode (ON for more frequency)
 input int      InpRelax2Hour         = 20;            // Switch to RELAX2 after this hour (earlier)
 input double   InpRelax2LotFactor    = 0.3;           // RELAX2 lot factor (more reduced)
-input int      InpRelax2SweepBreakPoints = 8;         // RELAX2 sweep break points (reduced)
+input int      InpRelax2SweepBreakPoints = 6;         // RELAX2 sweep break points (reduced more)
 input int      InpRelax2RollingLiqBars   = 24;        // RELAX2 rolling liquidity bars (reduced)
 input bool     InpRelax2AllowBiasNone    = true;      // RELAX2 allows bias=none
 input int      InpRelax2ReclaimMaxBars   = 4;         // RELAX2 reclaim max bars (more relaxed)
-input int      InpRelax2ConfirmMaxBars   = 15;        // RELAX2 CHOCH confirm max bars (more relaxed)
-input int      InpRelax2EntryTimeoutBars = 30;        // RELAX2 entry timeout bars (more relaxed)
-input double   InpRelax2RetraceRatio     = 0.25;      // RELAX2 retrace ratio (0.25 = 25%)
+input int      InpRelax2SwingK           = 1;         // RELAX2 swing lookback (1 = faster swing detection)
+input int      InpRelax2ConfirmMaxBars   = 25;        // RELAX2 CHOCH confirm max bars (much more relaxed)
+input int      InpRelax2EntryTimeoutBars = 45;        // RELAX2 entry timeout bars (much more relaxed)
+input double   InpRelax2RetraceRatio     = 0.20;      // RELAX2 retrace ratio (0.20 = 20%, easiest entry)
 
 input group "=== Martingale ==="
 input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRICT mode
@@ -461,13 +463,14 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v2.1 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v2.2 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
    Print("Target Trades: ", InpTargetTradesPerDay, " | Max Trades: ", InpMaxTradesPerDay, " | Cooldown: ", InpMinMinutesBetweenTrades, "m");
-   Print("RELAX: ", InpEnableRelaxMode, " @", InpRelaxSwitchHour, ":00 | Sweep: ", InpRelaxSweepBreakPoints, "pts | RollingLiq: ", InpRelaxRollingLiqBars, "bars");
-   Print("RELAX2: ", InpEnableRelax2, " @", InpRelax2Hour, ":00 | Sweep: ", InpRelax2SweepBreakPoints, "pts | RollingLiq: ", InpRelax2RollingLiqBars, "bars");
+   Print("RELAX: ", InpEnableRelaxMode, " @", InpRelaxSwitchHour, ":00 | Sweep: ", InpRelaxSweepBreakPoints, "pts | SwingK: ", InpRelaxSwingK, " | ConfirmBars: ", InpRelaxConfirmMaxBars);
+   Print("RELAX2: ", InpEnableRelax2, " @", InpRelax2Hour, ":00 | Sweep: ", InpRelax2SweepBreakPoints, "pts | SwingK: ", InpRelax2SwingK, " | ConfirmBars: ", InpRelax2ConfirmMaxBars);
+   Print("ATR Sweep: ", InpUseATRSweepThreshold, " | Factor: ", InpSweepATRFactor, " | STRICT ConfirmBars: ", InpConfirmMaxBars);
    Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Hard Block: ", InpEnableHardBlock ? StringFormat("%04d", InpHardBlockAfterHHMM) : "OFF");
    Print("24h Trading: ", InpEnable24hTrading, " | CSV Logging: ", InpEnableCSVLogging);
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
@@ -513,7 +516,7 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot v2.1 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v2.2 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -647,7 +650,8 @@ void DetectSwings(ENUM_TIMEFRAMES tf, double &swingHighs[], double &swingLows[],
    ArrayResize(swingHighBars, 0);
    ArrayResize(swingLowBars, 0);
    
-   int k = InpSwingK;
+   // Use tiered SwingK based on trade mode
+   int k = GetSwingK();
    
    for(int i = k; i < lookback - k; i++)
    {
@@ -2382,6 +2386,19 @@ double GetRetraceRatio()
 }
 
 //+------------------------------------------------------------------+
+//| Get swing K based on trade mode                                     |
+//+------------------------------------------------------------------+
+int GetSwingK()
+{
+   switch(g_tradeMode)
+   {
+      case MODE_RELAX2: return InpRelax2SwingK;
+      case MODE_RELAX:  return InpRelaxSwingK;
+      default:          return InpSwingK;
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Get current CHOCH mode based on trade mode                         |
 //+------------------------------------------------------------------+
 ENUM_CHOCH_MODE GetChochMode()
@@ -3405,7 +3422,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.0", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.2", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
