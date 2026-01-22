@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v2.5                         |
+//|                    SMC Scalping Bot v2.6                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v2.5"
+#property copyright "SMC Scalping Bot v2.6"
 #property link      ""
-#property version   "2.50"
+#property version   "2.60"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -204,11 +204,12 @@ input int      InpRelax2SwingK           = 1;         // RELAX2 swing lookback (
 input int      InpRelax2ConfirmMaxBars   = 18;        // RELAX2 CHOCH confirm max bars (user requested)
 input int      InpRelax2EntryTimeoutBars = 50;        // RELAX2 entry timeout bars (slightly increased)
 input double   InpRelax2RetraceRatio     = 0.22;      // RELAX2 retrace ratio (0.20-0.25 range)
-input bool     InpRelax2AllowMicroChoch  = true;       // Allow micro CHOCH fallback in RELAX2
-input double   InpMicroChochStartPct     = 0.65;       // Start micro CHOCH at this % of window (0.65 = 65%)
-input int      InpMicroChochMinBodyPts   = 12;         // Micro CHOCH min body size (points) - reduced
-input double   InpMicroChochATRFactor    = 0.20;       // Micro CHOCH min body as ATR factor - reduced
-input int      InpMicroSwingLookback     = 2;          // Micro swing lookback bars (1-3)
+input bool     InpEnableMicroChochRelax  = true;       // Enable micro CHOCH for RELAX mode
+input bool     InpEnableMicroChochRelax2 = true;       // Enable micro CHOCH for RELAX2 mode
+input double   InpMicroChochStartPct     = 0.55;       // Start micro CHOCH at this % of window (0.55 = 55%)
+input int      InpMicroBreakPts          = 5;          // Micro CHOCH min break size (points) - simplified
+input int      InpMicroMinBodyPts        = 5;          // Micro CHOCH min body size (points) - simplified
+input int      InpMicroSwingLookback     = 1;          // Micro swing lookback bars (1-2)
 
 input group "=== Martingale ==="
 input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRICT mode
@@ -351,11 +352,26 @@ string         g_lastCancelReason = "";
 datetime       g_lastCancelTime = 0;
 
 // Cancel Counters (daily statistics) - using array indexed by ENUM_CANCEL_REASON
-int            g_cancelCounters[CANCEL_COUNT];     // Daily counters
-int            g_totalCancelCounters[CANCEL_COUNT]; // Total counters for final summary
+int            g_cancelCounters[CANCEL_COUNT];     // Daily counters (legacy, keep for compatibility)
+int            g_totalCancelCounters[CANCEL_COUNT]; // Total counters for final summary (legacy)
 datetime       g_lastCancelBarTime[CANCEL_COUNT];  // Per-bar throttle: last bar time counted
 ENUM_CANCEL_REASON g_lastCancelReasonEnum = CANCEL_NONE; // Last cancel reason as enum
 bool           g_dailyLossDisabledLogged = false;  // Log once when disabled
+
+// 2D Cancel Counters by MODE [3 modes][CANCEL_COUNT reasons]
+// Index 0=STRICT, 1=RELAX, 2=RELAX2
+int            g_cancelByMode[3][CANCEL_COUNT];      // Daily counters by mode
+int            g_totalCancelByMode[3][CANCEL_COUNT]; // Total counters by mode
+
+// Microchoch Diagnostic Counters by MODE
+int            g_microchochAttempted[3];    // How many times TryMicroChoch was called
+int            g_microchochPass[3];         // How many times it succeeded
+int            g_microchochFailBreak[3];    // Failed: no break detected
+int            g_microchochFailBody[3];     // Failed: body too small
+int            g_totalMicrochochAttempted[3];
+int            g_totalMicrochochPass[3];
+int            g_totalMicrochochFailBreak[3];
+int            g_totalMicrochochFailBody[3];
 
 // Period tracking for final summary
 int            g_totalTradingDays = 0;
@@ -463,6 +479,25 @@ int OnInit()
    g_totalPnL = 0;
    g_totalSlHits = 0;
    
+   // Initialize 2D cancel counters by mode
+   for(int m = 0; m < 3; m++)
+   {
+      for(int r = 0; r < CANCEL_COUNT; r++)
+      {
+         g_cancelByMode[m][r] = 0;
+         g_totalCancelByMode[m][r] = 0;
+      }
+      // Initialize microchoch diagnostic counters
+      g_microchochAttempted[m] = 0;
+      g_microchochPass[m] = 0;
+      g_microchochFailBreak[m] = 0;
+      g_microchochFailBody[m] = 0;
+      g_totalMicrochochAttempted[m] = 0;
+      g_totalMicrochochPass[m] = 0;
+      g_totalMicrochochFailBreak[m] = 0;
+      g_totalMicrochochFailBody[m] = 0;
+   }
+   
    // Initialize CSV logging
    if(InpEnableCSVLogging)
    {
@@ -476,7 +511,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v2.5 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v2.6 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -485,7 +520,8 @@ int OnInit()
    Print("RELAX2: ", InpEnableRelax2, " @", InpRelax2Hour, ":00 | Sweep: ", InpRelax2SweepBreakPoints, "pts | SwingK: ", InpRelax2SwingK, " | ConfirmBars: ", InpRelax2ConfirmMaxBars);
    Print("ATR Sweep: ", InpUseATRSweepThreshold, " | Factor: ", InpSweepATRFactor, " | STRICT ConfirmBars: ", InpConfirmMaxBars);
    Print("2-Stage CHOCH: ", InpUse2StageChoch, " | Stage2 Confirm: ", InpStage2ConfirmBars, " bars");
-   Print("Micro CHOCH (RELAX2): ", InpRelax2AllowMicroChoch, " | Start@", (int)(InpMicroChochStartPct*100), "% | MinBody: ", InpMicroChochMinBodyPts, "pts | ATR: ", InpMicroChochATRFactor, " | Lookback: ", InpMicroSwingLookback);
+   Print("Micro CHOCH: RELAX=", InpEnableMicroChochRelax, " RELAX2=", InpEnableMicroChochRelax2, 
+         " | Start@", (int)(InpMicroChochStartPct*100), "% | Break>=", InpMicroBreakPts, "pts | Body>=", InpMicroMinBodyPts, "pts | Lookback=", InpMicroSwingLookback);
    Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Hard Block: ", InpEnableHardBlock ? StringFormat("%04d", InpHardBlockAfterHHMM) : "OFF");
    Print("24h Trading: ", InpEnable24hTrading, " | CSV Logging: ", InpEnableCSVLogging);
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
@@ -531,7 +567,7 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot v2.5 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v2.6 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -1180,13 +1216,15 @@ void LookForChoCH()
       return;
    }
    
-   // Check if we should try micro CHOCH fallback (RELAX2 only)
-   // Start considering micro CHOCH at InpMicroChochStartPct of window (e.g., 65% = bar 12 of 18)
-   bool tryMicroChoch = false;
+   // Check if we should try micro CHOCH fallback (RELAX or RELAX2)
+   // Start considering micro CHOCH at InpMicroChochStartPct of window (e.g., 55% = bar 10 of 18)
+   bool microChochEnabled = false;
+   if(g_tradeMode == MODE_RELAX && InpEnableMicroChochRelax) microChochEnabled = true;
+   if(g_tradeMode == MODE_RELAX2 && InpEnableMicroChochRelax2) microChochEnabled = true;
+   
    int microChochStartBar = (int)(confirmMaxBars * InpMicroChochStartPct);
-   if(g_tradeMode == MODE_RELAX2 && InpRelax2AllowMicroChoch && barsSinceSweep >= microChochStartBar)
+   if(microChochEnabled && barsSinceSweep >= microChochStartBar)
    {
-      tryMicroChoch = true;
       // Try micro CHOCH every bar from start point onwards
       if(TryMicroChochFallback())
       {
@@ -1336,12 +1374,19 @@ void LookForChoCH()
 }
 
 //+------------------------------------------------------------------+
-//| Try micro CHOCH fallback for RELAX2 mode                           |
-//| Uses smaller swing lookback with relaxed requirements              |
-//| Guard: body >= min(InpMicroChochMinBodyPts, ATR*factor) - OR logic |
+//| Try micro CHOCH fallback for RELAX/RELAX2 mode                      |
+//| SIMPLIFIED VERSION for debugging - minimal requirements             |
+//| Requirements: close break >= InpMicroBreakPts AND body >= InpMicroMinBodyPts |
 //+------------------------------------------------------------------+
 bool TryMicroChochFallback()
 {
+   // Get mode index for diagnostic counters
+   int modeIdx = (int)g_tradeMode;
+   if(modeIdx < 0 || modeIdx > 2) modeIdx = 0;
+   
+   // Increment attempted counter
+   g_microchochAttempted[modeIdx]++;
+   
    // Get current bar data
    double open = iOpen(tradeSym, InpEntryTF, 0);
    double close = iClose(tradeSym, InpEntryTF, 0);
@@ -1352,34 +1397,25 @@ bool TryMicroChochFallback()
    double bodySize = MathAbs(close - open);
    int bodyPoints = (int)(bodySize / _Point);
    
-   // Check minimum body size using OR logic (either fixed OR ATR-based)
-   // This is more relaxed than AND logic
-   int fixedMinBody = InpMicroChochMinBodyPts;
-   int atrMinBody = 0;
-   if(g_currentATR > 0)
+   // SIMPLIFIED: Just use fixed minimum body (no ATR)
+   int minBodyPts = InpMicroMinBodyPts;
+   int minBreakPts = InpMicroBreakPts;
+   
+   // Check body size first
+   if(bodyPoints < minBodyPts)
    {
-      atrMinBody = (int)(g_currentATR * InpMicroChochATRFactor / _Point);
+      g_microchochFailBody[modeIdx]++;
+      return false;
    }
    
-   // Use minimum of the two (OR logic = easier to pass)
-   int minBodyPts = (atrMinBody > 0) ? MathMin(fixedMinBody, atrMinBody) : fixedMinBody;
-   
-   // Ensure minimum is at least 8 points for safety
-   minBodyPts = MathMax(minBodyPts, 8);
-   
-   bool bodyOK = (bodyPoints >= minBodyPts);
-   bool isBullishCandle = (close > open);
-   bool isBearishCandle = (close < open);
-   
-   // For micro CHOCH, we're more relaxed on candle direction
-   // Just need the break to happen in correct direction
-   bool microChochOK = false;
+   // Find micro swing using simple lookback
+   int lookback = MathMax(1, MathMin(2, InpMicroSwingLookback));
+   bool hasBreak = false;
    double microLevel = 0;
-   int lookback = MathMax(1, MathMin(3, InpMicroSwingLookback));
+   int breakPts = 0;
    
    if(g_sweepType == SWEEP_BULLISH)
    {
-      // For bullish sweep, look for break above micro swing high
       // Find micro swing high from last N bars
       double microSwingHigh = 0;
       for(int i = 1; i <= lookback; i++)
@@ -1388,24 +1424,19 @@ bool TryMicroChochFallback()
          if(h > microSwingHigh) microSwingHigh = h;
       }
       
-      // Check if current bar breaks above micro swing
-      // Relaxed: accept wick break OR close break
-      // Body check is optional if we have strong break
-      bool hasBreak = (microSwingHigh > 0 && (high > microSwingHigh || close > microSwingHigh));
-      
-      if(hasBreak)
+      // Check close break (simplified - just close, not wick)
+      if(microSwingHigh > 0 && close > microSwingHigh)
       {
-         // Either body is OK, OR we have a bullish candle (relaxed)
-         if(bodyOK || isBullishCandle)
+         breakPts = (int)((close - microSwingHigh) / _Point);
+         if(breakPts >= minBreakPts)
          {
-            microChochOK = true;
+            hasBreak = true;
             microLevel = microSwingHigh;
          }
       }
    }
    else if(g_sweepType == SWEEP_BEARISH)
    {
-      // For bearish sweep, look for break below micro swing low
       // Find micro swing low from last N bars
       double microSwingLow = DBL_MAX;
       for(int i = 1; i <= lookback; i++)
@@ -1414,43 +1445,45 @@ bool TryMicroChochFallback()
          if(l < microSwingLow) microSwingLow = l;
       }
       
-      // Check if current bar breaks below micro swing
-      // Relaxed: accept wick break OR close break
-      bool hasBreak = (microSwingLow < DBL_MAX && (low < microSwingLow || close < microSwingLow));
-      
-      if(hasBreak)
+      // Check close break (simplified - just close, not wick)
+      if(microSwingLow < DBL_MAX && close < microSwingLow)
       {
-         // Either body is OK, OR we have a bearish candle (relaxed)
-         if(bodyOK || isBearishCandle)
+         breakPts = (int)((microSwingLow - close) / _Point);
+         if(breakPts >= minBreakPts)
          {
-            microChochOK = true;
+            hasBreak = true;
             microLevel = microSwingLow;
          }
       }
    }
    
-   if(microChochOK)
+   if(!hasBreak)
    {
-      g_chochLevel = microLevel;
-      g_chochBar = 0;
-      g_state = STATE_WAIT_RETRACE;
-      
-      // Reset stage1 tracking
-      g_chochStage1 = false;
-      g_chochStage1Level = 0;
-      g_chochStage1Bar = 0;
-      
-      // Build zones
-      BuildZones(g_sweepType == SWEEP_BULLISH);
-      
-      // Record that micro CHOCH was used (info counter, not cancel)
-      RecordCancel(INFO_MICROCHOCH_USED);
-      
-      Print("MICRO CHOCH used at ", microLevel, " | Body: ", bodyPoints, "pts (min: ", minBodyPts, ") | Lookback: ", lookback, " | Sweep: ", EnumToString(g_sweepType));
-      return true;
+      g_microchochFailBreak[modeIdx]++;
+      return false;
    }
    
-   return false;
+   // SUCCESS - micro CHOCH confirmed
+   g_microchochPass[modeIdx]++;
+   
+   g_chochLevel = microLevel;
+   g_chochBar = 0;
+   g_state = STATE_WAIT_RETRACE;
+   
+   // Reset stage1 tracking
+   g_chochStage1 = false;
+   g_chochStage1Level = 0;
+   g_chochStage1Bar = 0;
+   
+   // Build zones
+   BuildZones(g_sweepType == SWEEP_BULLISH);
+   
+   // Record that micro CHOCH was used (info counter)
+   RecordCancel(INFO_MICROCHOCH_USED);
+   
+   Print("MICRO CHOCH [" + EnumToString(g_tradeMode) + "] at ", microLevel, 
+         " | Break: ", breakPts, "pts (min:", minBreakPts, ") | Body: ", bodyPoints, "pts (min:", minBodyPts, ")");
+   return true;
 }
 
 //=== ZONE BUILDING ===
@@ -2898,6 +2931,13 @@ void RecordCancel(ENUM_CANCEL_REASON reason)
    g_lastCancelBarTime[reason] = currentBarTime;
    g_cancelCounters[reason]++;
    
+   // Also record in 2D array by mode
+   int modeIdx = (int)g_tradeMode; // 0=STRICT, 1=RELAX, 2=RELAX2
+   if(modeIdx >= 0 && modeIdx < 3)
+   {
+      g_cancelByMode[modeIdx][reason]++;
+   }
+   
    // Throttled logging (60 sec per reason)
    static datetime lastLogTimes[CANCEL_COUNT];
    if(InpEnableLogging && (TimeCurrent() - lastLogTimes[reason] >= 60))
@@ -3121,6 +3161,20 @@ void ResetDailyCounters()
       {
          g_totalCancelCounters[i] += g_cancelCounters[i];
       }
+      
+      // Add daily 2D counters to totals
+      for(int m = 0; m < 3; m++)
+      {
+         for(int r = 0; r < CANCEL_COUNT; r++)
+         {
+            g_totalCancelByMode[m][r] += g_cancelByMode[m][r];
+         }
+         // Add microchoch counters
+         g_totalMicrochochAttempted[m] += g_microchochAttempted[m];
+         g_totalMicrochochPass[m] += g_microchochPass[m];
+         g_totalMicrochochFailBreak[m] += g_microchochFailBreak[m];
+         g_totalMicrochochFailBody[m] += g_microchochFailBody[m];
+      }
    }
    
    g_tradesToday = 0;
@@ -3140,6 +3194,19 @@ void ResetDailyCounters()
    g_lastCancelReasonEnum = CANCEL_NONE;
    g_dailyLossDisabledLogged = false;
    
+   // Reset 2D cancel counters and microchoch diagnostics
+   for(int m = 0; m < 3; m++)
+   {
+      for(int r = 0; r < CANCEL_COUNT; r++)
+      {
+         g_cancelByMode[m][r] = 0;
+      }
+      g_microchochAttempted[m] = 0;
+      g_microchochPass[m] = 0;
+      g_microchochFailBreak[m] = 0;
+      g_microchochFailBody[m] = 0;
+   }
+   
    Print("=== DAILY RESET ===");
    Print("Start equity: ", g_dailyStartEquity);
    Print("Trade mode reset to STRICT");
@@ -3154,44 +3221,61 @@ void PrintDailySummary()
    Print("Trades executed: ", g_tradesToday);
    Print("SL Hits: ", g_slHitsToday, "/", InpMaxSLHitsPerDay);
    Print("Daily PnL: ", DoubleToString(g_dailyPnL, 2));
-   Print("--- Cancel Reasons (sorted by count) ---");
    
-   // Sort and print cancel reasons by count (descending)
-   int sortedIdx[];
-   int sortedCounts[];
-   ArrayResize(sortedIdx, CANCEL_COUNT);
-   ArrayResize(sortedCounts, CANCEL_COUNT);
-   
-   for(int i = 0; i < CANCEL_COUNT; i++)
+   // Print microchoch diagnostics by mode
+   Print("--- Microchoch Diagnostics (Today) ---");
+   string modeNames[3] = {"STRICT", "RELAX", "RELAX2"};
+   for(int m = 0; m < 3; m++)
    {
-      sortedIdx[i] = i;
-      sortedCounts[i] = g_cancelCounters[i];
+      if(g_microchochAttempted[m] > 0)
+      {
+         Print("  ", modeNames[m], ": Attempted=", g_microchochAttempted[m], 
+               " Pass=", g_microchochPass[m], 
+               " FailBreak=", g_microchochFailBreak[m], 
+               " FailBody=", g_microchochFailBody[m]);
+      }
    }
    
-   // Simple bubble sort by count descending
-   for(int i = 0; i < CANCEL_COUNT - 1; i++)
+   // Print cancel by mode (top 3 per mode)
+   Print("--- Cancel by Mode (Top 3) ---");
+   for(int m = 0; m < 3; m++)
    {
-      for(int j = i + 1; j < CANCEL_COUNT; j++)
+      int modeTotal = 0;
+      for(int r = 0; r < CANCEL_COUNT; r++) modeTotal += g_cancelByMode[m][r];
+      if(modeTotal == 0) continue;
+      
+      // Sort this mode's cancels
+      int sortedIdx[CANCEL_COUNT];
+      int sortedCounts[CANCEL_COUNT];
+      for(int i = 0; i < CANCEL_COUNT; i++)
       {
-         if(sortedCounts[j] > sortedCounts[i])
+         sortedIdx[i] = i;
+         sortedCounts[i] = g_cancelByMode[m][i];
+      }
+      for(int i = 0; i < CANCEL_COUNT - 1; i++)
+      {
+         for(int j = i + 1; j < CANCEL_COUNT; j++)
          {
-            int tmpIdx = sortedIdx[i];
-            int tmpCnt = sortedCounts[i];
-            sortedIdx[i] = sortedIdx[j];
-            sortedCounts[i] = sortedCounts[j];
-            sortedIdx[j] = tmpIdx;
-            sortedCounts[j] = tmpCnt;
+            if(sortedCounts[j] > sortedCounts[i])
+            {
+               int tmpIdx = sortedIdx[i];
+               int tmpCnt = sortedCounts[i];
+               sortedIdx[i] = sortedIdx[j];
+               sortedCounts[i] = sortedCounts[j];
+               sortedIdx[j] = tmpIdx;
+               sortedCounts[j] = tmpCnt;
+            }
          }
       }
-   }
-   
-   // Print only non-zero counts
-   for(int i = 0; i < CANCEL_COUNT; i++)
-   {
-      if(sortedCounts[i] > 0)
+      
+      string line = modeNames[m] + "(" + IntegerToString(modeTotal) + "): ";
+      for(int i = 0; i < 3 && sortedCounts[i] > 0; i++)
       {
-         Print("  ", GetCancelReasonName((ENUM_CANCEL_REASON)sortedIdx[i]), ": ", sortedCounts[i]);
+         double pct = (double)sortedCounts[i] / modeTotal * 100;
+         line += GetCancelReasonName((ENUM_CANCEL_REASON)sortedIdx[i]) + "=" + 
+                 IntegerToString(sortedCounts[i]) + "(" + DoubleToString(pct, 0) + "%) ";
       }
+      Print("  ", line);
    }
    Print("====================");
 }
@@ -3214,6 +3298,26 @@ void PrintFinalSummary()
       finalCounters[i] = g_totalCancelCounters[i] + g_cancelCounters[i];
    }
    
+   // Add current day's 2D counters to totals
+   int finalByMode[3][CANCEL_COUNT];
+   for(int m = 0; m < 3; m++)
+   {
+      for(int r = 0; r < CANCEL_COUNT; r++)
+      {
+         finalByMode[m][r] = g_totalCancelByMode[m][r] + g_cancelByMode[m][r];
+      }
+   }
+   
+   // Add current day's microchoch counters to totals
+   int finalMicroAttempted[3], finalMicroPass[3], finalMicroFailBreak[3], finalMicroFailBody[3];
+   for(int m = 0; m < 3; m++)
+   {
+      finalMicroAttempted[m] = g_totalMicrochochAttempted[m] + g_microchochAttempted[m];
+      finalMicroPass[m] = g_totalMicrochochPass[m] + g_microchochPass[m];
+      finalMicroFailBreak[m] = g_totalMicrochochFailBreak[m] + g_microchochFailBreak[m];
+      finalMicroFailBody[m] = g_totalMicrochochFailBody[m] + g_microchochFailBody[m];
+   }
+   
    if(totalDays == 0 && g_tradesToday > 0)
       totalDays = 1;
    
@@ -3226,9 +3330,68 @@ void PrintFinalSummary()
    Print("Total SL hits: ", totalSL);
    Print("Total PnL: ", DoubleToString(totalPnL, 2));
    Print("");
-   Print("--- Top 10 Cancel Reasons (All Time) ---");
    
-   // Sort and print top 5 cancel reasons
+   // Print microchoch diagnostics (ALL TIME)
+   Print("--- Microchoch Diagnostics (All Time) ---");
+   string modeNames[3] = {"STRICT", "RELAX", "RELAX2"};
+   for(int m = 0; m < 3; m++)
+   {
+      if(finalMicroAttempted[m] > 0)
+      {
+         double passRate = (double)finalMicroPass[m] / finalMicroAttempted[m] * 100;
+         Print("  ", modeNames[m], ": Attempted=", finalMicroAttempted[m], 
+               " Pass=", finalMicroPass[m], " (", DoubleToString(passRate, 1), "%)",
+               " FailBreak=", finalMicroFailBreak[m], 
+               " FailBody=", finalMicroFailBody[m]);
+      }
+   }
+   Print("");
+   
+   // Print cancel by mode (Top 5 per mode)
+   Print("--- Cancel by Mode (Top 5 each) ---");
+   for(int m = 0; m < 3; m++)
+   {
+      int modeTotal = 0;
+      for(int r = 0; r < CANCEL_COUNT; r++) modeTotal += finalByMode[m][r];
+      if(modeTotal == 0) continue;
+      
+      Print(modeNames[m], " (Total: ", modeTotal, ")");
+      
+      // Sort this mode's cancels
+      int sortedIdx[CANCEL_COUNT];
+      int sortedCounts[CANCEL_COUNT];
+      for(int i = 0; i < CANCEL_COUNT; i++)
+      {
+         sortedIdx[i] = i;
+         sortedCounts[i] = finalByMode[m][i];
+      }
+      for(int i = 0; i < CANCEL_COUNT - 1; i++)
+      {
+         for(int j = i + 1; j < CANCEL_COUNT; j++)
+         {
+            if(sortedCounts[j] > sortedCounts[i])
+            {
+               int tmpIdx = sortedIdx[i];
+               int tmpCnt = sortedCounts[i];
+               sortedIdx[i] = sortedIdx[j];
+               sortedCounts[i] = sortedCounts[j];
+               sortedIdx[j] = tmpIdx;
+               sortedCounts[j] = tmpCnt;
+            }
+         }
+      }
+      
+      for(int i = 0; i < 5 && sortedCounts[i] > 0; i++)
+      {
+         double pct = (double)sortedCounts[i] / modeTotal * 100;
+         Print("    ", i+1, ". ", GetCancelReasonName((ENUM_CANCEL_REASON)sortedIdx[i]), 
+               ": ", sortedCounts[i], " (", DoubleToString(pct, 1), "%)");
+      }
+   }
+   Print("");
+   
+   // Print overall top 10
+   Print("--- Top 10 Cancel Reasons (All Modes Combined) ---");
    int sortedIdx[];
    int sortedCounts[];
    ArrayResize(sortedIdx, CANCEL_COUNT);
@@ -3240,7 +3403,6 @@ void PrintFinalSummary()
       sortedCounts[i] = finalCounters[i];
    }
    
-   // Simple bubble sort by count descending
    for(int i = 0; i < CANCEL_COUNT - 1; i++)
    {
       for(int j = i + 1; j < CANCEL_COUNT; j++)
@@ -3257,20 +3419,15 @@ void PrintFinalSummary()
       }
    }
    
-   // Calculate total cancels for percentage
    int totalCancels = 0;
    for(int j = 0; j < CANCEL_COUNT; j++) totalCancels += finalCounters[j];
    
    Print("Total cancel events: ", totalCancels);
-   Print("");
-   
-   // Print top 10
    for(int i = 0; i < 10 && i < CANCEL_COUNT; i++)
    {
       if(sortedCounts[i] > 0)
       {
          double pct = totalCancels > 0 ? (double)sortedCounts[i] / totalCancels * 100 : 0;
-         
          Print("  ", i+1, ". ", GetCancelReasonName((ENUM_CANCEL_REASON)sortedIdx[i]), 
                ": ", sortedCounts[i], " (", DoubleToString(pct, 1), "%)");
       }
@@ -3640,7 +3797,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.5", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.6", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
