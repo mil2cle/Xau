@@ -100,7 +100,8 @@ enum ENUM_CANCEL_REASON
    CANCEL_SWEEP_TIMEOUT,
    CANCEL_CHOCH_TIMEOUT,
    CANCEL_RETRACE_TIMEOUT,
-   CANCEL_COUNT              // Total count of reasons (removed OTHER)
+   CANCEL_OTHER,             // Catch-all for unknown reasons
+   CANCEL_COUNT              // Total count of reasons
 };
 
 enum ENUM_CHOCH_MODE
