@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v1.0                         |
-//|                    For DEMO Account Only - XAUUSD.iux            |
+//|                    SMC Scalping Bot v1.1                         |
+//|                    For DEMO Account Only - XAUUSD variants       |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v1.0"
+#property copyright "SMC Scalping Bot v1.1"
 #property link      ""
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -66,7 +66,7 @@ enum ENUM_MARTINGALE_MODE
 
 //=== INPUT PARAMETERS ===
 input group "=== Symbol & Timeframe ==="
-input string   InpSymbol            = "XAUUSD.iux";    // Symbol
+input string   InpTradeSymbol       = "";             // Symbol (empty = use chart symbol)
 input ENUM_TIMEFRAMES InpBiasTF     = PERIOD_M15;     // Bias Timeframe
 input ENUM_TIMEFRAMES InpEntryTF    = PERIOD_M5;      // Entry Timeframe
 
@@ -115,6 +115,7 @@ input group "=== Logging ==="
 input bool     InpEnableLogging     = true;           // Enable CSV logging
 
 //=== GLOBAL VARIABLES ===
+string         tradeSym;             // Resolved trading symbol
 CTrade         trade;
 CPositionInfo  posInfo;
 COrderInfo     orderInfo;
@@ -183,11 +184,27 @@ string         g_objPrefix = "SMC_";
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Validate symbol
-   if(Symbol() != InpSymbol)
+   // Resolve trading symbol
+   if(InpTradeSymbol == "")
    {
-      Print("Warning: EA designed for ", InpSymbol, " but attached to ", Symbol());
+      tradeSym = _Symbol;
    }
+   else
+   {
+      tradeSym = InpTradeSymbol;
+   }
+   
+   // Validate symbol - flexible matching for XAUUSD variants
+   if(StringFind(InpTradeSymbol, "XAUUSD") == 0 || InpTradeSymbol == "")
+   {
+      // Accept any symbol starting with XAUUSD (XAUUSD, XAUUSDm, XAUUSD.iux, etc.)
+      if(StringFind(_Symbol, "XAUUSD") != 0 && InpTradeSymbol != "")
+      {
+         Print("Warning: Chart symbol ", _Symbol, " does not match expected XAUUSD variant");
+      }
+   }
+   
+   Print("Trading symbol resolved: ", tradeSym);
    
    // Initialize trade object
    trade.SetExpertMagicNumber(123456);
@@ -212,7 +229,7 @@ int OnInit()
    // Initial calculations
    CalculateLiquidityLevels();
    
-   Print("SMC Scalping Bot v1.0 initialized on ", InpSymbol);
+   Print("SMC Scalping Bot v1.0 initialized on ", tradeSym);
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    
    return(INIT_SUCCEEDED);
@@ -268,7 +285,7 @@ void OnTick()
       DrawLiquidityLevels();
    
    // Check if we have open position
-   if(PositionSelect(InpSymbol))
+   if(PositionSelect(tradeSym))
    {
       g_state = STATE_MANAGE_TRADE;
       ManageTrade();
@@ -327,7 +344,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
       // A deal was added - check if it's ours
-      if(trans.symbol == InpSymbol)
+      if(trans.symbol == tradeSym)
       {
          // Will be handled in ManageTrade
       }
@@ -350,17 +367,17 @@ void DetectSwings(ENUM_TIMEFRAMES tf, double &swingHighs[], double &swingLows[],
    
    for(int i = k; i < lookback - k; i++)
    {
-      double high_i = iHigh(InpSymbol, tf, i);
-      double low_i = iLow(InpSymbol, tf, i);
+      double high_i = iHigh(tradeSym, tf, i);
+      double low_i = iLow(tradeSym, tf, i);
       
       bool isSwingHigh = true;
       bool isSwingLow = true;
       
       for(int j = 1; j <= k; j++)
       {
-         if(high_i <= iHigh(InpSymbol, tf, i - j) || high_i <= iHigh(InpSymbol, tf, i + j))
+         if(high_i <= iHigh(tradeSym, tf, i - j) || high_i <= iHigh(tradeSym, tf, i + j))
             isSwingHigh = false;
-         if(low_i >= iLow(InpSymbol, tf, i - j) || low_i >= iLow(InpSymbol, tf, i + j))
+         if(low_i >= iLow(tradeSym, tf, i - j) || low_i >= iLow(tradeSym, tf, i + j))
             isSwingLow = false;
       }
       
@@ -431,8 +448,8 @@ double GetLatestMinorSwingLow(ENUM_TIMEFRAMES tf, int &barIndex)
 void CalculateLiquidityLevels()
 {
    // PDH/PDL
-   g_pdh = iHigh(InpSymbol, PERIOD_D1, 1);
-   g_pdl = iLow(InpSymbol, PERIOD_D1, 1);
+   g_pdh = iHigh(tradeSym, PERIOD_D1, 1);
+   g_pdl = iLow(tradeSym, PERIOD_D1, 1);
    
    // Session High/Low (current day)
    CalculateSessionHighLow();
@@ -455,15 +472,15 @@ void CalculateSessionHighLow()
    g_sessionHigh = 0;
    g_sessionLow = DBL_MAX;
    
-   int bars = iBars(InpSymbol, InpEntryTF);
+   int bars = iBars(tradeSym, InpEntryTF);
    for(int i = 0; i < bars; i++)
    {
-      datetime barTime = iTime(InpSymbol, InpEntryTF, i);
+      datetime barTime = iTime(tradeSym, InpEntryTF, i);
       if(barTime < dayStart)
          break;
       
-      double high = iHigh(InpSymbol, InpEntryTF, i);
-      double low = iLow(InpSymbol, InpEntryTF, i);
+      double high = iHigh(tradeSym, InpEntryTF, i);
+      double low = iLow(tradeSym, InpEntryTF, i);
       
       if(high > g_sessionHigh) g_sessionHigh = high;
       if(low < g_sessionLow) g_sessionLow = low;
@@ -715,9 +732,9 @@ bool IsSweepLevel(double level, double sweepBreak, bool isHigh)
 {
    for(int bar = 0; bar <= InpReclaimMaxBars; bar++)
    {
-      double high = iHigh(InpSymbol, InpEntryTF, bar);
-      double low = iLow(InpSymbol, InpEntryTF, bar);
-      double close = iClose(InpSymbol, InpEntryTF, bar);
+      double high = iHigh(tradeSym, InpEntryTF, bar);
+      double low = iLow(tradeSym, InpEntryTF, bar);
+      double close = iClose(tradeSym, InpEntryTF, bar);
       
       if(isHigh)
       {
@@ -764,7 +781,7 @@ void LookForChoCH()
       
       if(minorSwingHigh > 0 && minorSwingBar > 0)
       {
-         double close = iClose(InpSymbol, InpEntryTF, 0);
+         double close = iClose(tradeSym, InpEntryTF, 0);
          if(close > minorSwingHigh)
          {
             g_chochLevel = minorSwingHigh;
@@ -785,7 +802,7 @@ void LookForChoCH()
       
       if(minorSwingLow > 0 && minorSwingBar > 0)
       {
-         double close = iClose(InpSymbol, InpEntryTF, 0);
+         double close = iClose(tradeSym, InpEntryTF, 0);
          if(close < minorSwingLow)
          {
             g_chochLevel = minorSwingLow;
@@ -846,10 +863,10 @@ bool FindFVG(bool isBullish)
    // Look for FVG in recent bars after CHOCH
    for(int i = 1; i <= 10; i++)
    {
-      double high1 = iHigh(InpSymbol, InpEntryTF, i);
-      double low1 = iLow(InpSymbol, InpEntryTF, i);
-      double high3 = iHigh(InpSymbol, InpEntryTF, i + 2);
-      double low3 = iLow(InpSymbol, InpEntryTF, i + 2);
+      double high1 = iHigh(tradeSym, InpEntryTF, i);
+      double low1 = iLow(tradeSym, InpEntryTF, i);
+      double high3 = iHigh(tradeSym, InpEntryTF, i + 2);
+      double low3 = iLow(tradeSym, InpEntryTF, i + 2);
       
       if(isBullish)
       {
@@ -886,10 +903,10 @@ bool FindOB(bool isBullish)
    // Look for OB - last opposite candle before impulse
    for(int i = 1; i <= 15; i++)
    {
-      double open_i = iOpen(InpSymbol, InpEntryTF, i);
-      double close_i = iClose(InpSymbol, InpEntryTF, i);
-      double high_i = iHigh(InpSymbol, InpEntryTF, i);
-      double low_i = iLow(InpSymbol, InpEntryTF, i);
+      double open_i = iOpen(tradeSym, InpEntryTF, i);
+      double close_i = iClose(tradeSym, InpEntryTF, i);
+      double high_i = iHigh(tradeSym, InpEntryTF, i);
+      double low_i = iLow(tradeSym, InpEntryTF, i);
       
       if(isBullish)
       {
@@ -897,8 +914,8 @@ bool FindOB(bool isBullish)
          if(close_i < open_i)
          {
             // Check if next candle is bullish impulse
-            double close_next = iClose(InpSymbol, InpEntryTF, i - 1);
-            double open_next = iOpen(InpSymbol, InpEntryTF, i - 1);
+            double close_next = iClose(tradeSym, InpEntryTF, i - 1);
+            double open_next = iOpen(tradeSym, InpEntryTF, i - 1);
             
             if(close_next > open_next && close_next > high_i)
             {
@@ -914,8 +931,8 @@ bool FindOB(bool isBullish)
          // Bearish OB = bullish candle before impulse down
          if(close_i > open_i)
          {
-            double close_next = iClose(InpSymbol, InpEntryTF, i - 1);
-            double open_next = iOpen(InpSymbol, InpEntryTF, i - 1);
+            double close_next = iClose(tradeSym, InpEntryTF, i - 1);
+            double open_next = iOpen(tradeSym, InpEntryTF, i - 1);
             
             if(close_next < open_next && close_next < low_i)
             {
@@ -946,8 +963,8 @@ void LookForRetrace()
       return;
    }
    
-   double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(tradeSym, SYMBOL_BID);
+   double ask = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
    
    // Check if price is in zone
    if(g_sweepType == SWEEP_BULLISH)
@@ -994,14 +1011,14 @@ void PlaceOrder()
    if(g_sweepType == SWEEP_BULLISH)
    {
       orderType = ORDER_TYPE_BUY;
-      price = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+      price = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
       sl = g_slPrice;
       tp = g_tp1Price;
    }
    else
    {
       orderType = ORDER_TYPE_SELL;
-      price = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+      price = SymbolInfoDouble(tradeSym, SYMBOL_BID);
       sl = g_slPrice;
       tp = g_tp1Price;
    }
@@ -1015,7 +1032,7 @@ void PlaceOrder()
                                  g_sweepType == SWEEP_BULLISH ? "LONG" : "SHORT",
                                  g_martLevel);
    
-   if(trade.PositionOpen(InpSymbol, orderType, g_currentLot, price, sl, tp, comment))
+   if(trade.PositionOpen(tradeSym, orderType, g_currentLot, price, sl, tp, comment))
    {
       g_currentTicket = trade.ResultOrder();
       g_entryPrice = price;
@@ -1090,12 +1107,12 @@ double GetSweepExtreme(bool isHigh)
    {
       if(isHigh)
       {
-         double h = iHigh(InpSymbol, InpEntryTF, i);
+         double h = iHigh(tradeSym, InpEntryTF, i);
          if(h > extreme) extreme = h;
       }
       else
       {
-         double l = iLow(InpSymbol, InpEntryTF, i);
+         double l = iLow(tradeSym, InpEntryTF, i);
          if(l < extreme) extreme = l;
       }
    }
@@ -1108,7 +1125,7 @@ double GetSweepExtreme(bool isHigh)
 //+------------------------------------------------------------------+
 double GetNearestOppositeLiquidity(bool isLong)
 {
-   double currentPrice = SymbolInfoDouble(InpSymbol, isLong ? SYMBOL_ASK : SYMBOL_BID);
+   double currentPrice = SymbolInfoDouble(tradeSym, isLong ? SYMBOL_ASK : SYMBOL_BID);
    double nearest = isLong ? DBL_MAX : 0;
    
    if(isLong)
@@ -1189,7 +1206,7 @@ double GetFurtherLiquidity(bool isLong)
 //+------------------------------------------------------------------+
 void ManageTrade()
 {
-   if(!PositionSelect(InpSymbol))
+   if(!PositionSelect(tradeSym))
    {
       // Position closed
       CheckTradeResult();
@@ -1206,8 +1223,8 @@ void ManageTrade()
    long posType = PositionGetInteger(POSITION_TYPE);
    
    double currentPrice = (posType == POSITION_TYPE_BUY) ? 
-                         SymbolInfoDouble(InpSymbol, SYMBOL_BID) :
-                         SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
+                         SymbolInfoDouble(tradeSym, SYMBOL_BID) :
+                         SymbolInfoDouble(tradeSym, SYMBOL_ASK);
    
    double riskPoints = MathAbs(posOpenPrice - posSL);
    double profitPoints = MathAbs(currentPrice - posOpenPrice);
@@ -1229,7 +1246,7 @@ void ManageTrade()
          double closeVolume = NormalizeDouble(posVolume * InpPartialClosePercent / 100.0, 2);
          if(closeVolume >= 0.01)
          {
-            if(trade.PositionClosePartial(InpSymbol, closeVolume))
+            if(trade.PositionClosePartial(tradeSym, closeVolume))
             {
                g_partialClosed = true;
                
@@ -1242,7 +1259,7 @@ void ManageTrade()
                else
                   newSL = posOpenPrice - spreadPoints * _Point;
                
-               trade.PositionModify(InpSymbol, newSL, g_tp2Price);
+               trade.PositionModify(tradeSym, newSL, g_tp2Price);
                
                Print("Partial close done. New SL: ", newSL, " New TP: ", g_tp2Price);
             }
@@ -1341,7 +1358,7 @@ bool PassRiskChecks()
    }
    
    // No overlapping positions
-   if(PositionSelect(InpSymbol))
+   if(PositionSelect(tradeSym))
    {
       return false;
    }
@@ -1400,7 +1417,7 @@ bool IsWithinTradingHours()
 ENUM_BIAS GetBias()
 {
    int barIndex;
-   double close = iClose(InpSymbol, InpBiasTF, 0);
+   double close = iClose(tradeSym, InpBiasTF, 0);
    
    double minorSwingHigh = GetLatestMinorSwingHigh(InpBiasTF, barIndex);
    double minorSwingLow = GetLatestMinorSwingLow(InpBiasTF, barIndex);
@@ -1430,9 +1447,9 @@ double CalculateLot()
    lot = MathMin(lot, InpLotCapMax);
    
    // Normalize
-   double minLot = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
-   double maxLot = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MAX);
-   double lotStep = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_STEP);
+   double minLot = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_STEP);
    
    lot = MathMax(minLot, MathMin(maxLot, lot));
    lot = MathFloor(lot / lotStep) * lotStep;
@@ -1446,8 +1463,8 @@ double CalculateLot()
 //+------------------------------------------------------------------+
 double GetSpreadPoints()
 {
-   double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(tradeSym, SYMBOL_BID);
    return (ask - bid) / _Point;
 }
 
@@ -1456,7 +1473,7 @@ double GetSpreadPoints()
 //+------------------------------------------------------------------+
 double GetATR(int period)
 {
-   int handle = iATR(InpSymbol, InpEntryTF, period);
+   int handle = iATR(tradeSym, InpEntryTF, period);
    if(handle == INVALID_HANDLE) return 0;
    
    double atr[];
@@ -1541,7 +1558,7 @@ bool HasPendingOrder()
    {
       if(orderInfo.SelectByIndex(i))
       {
-         if(orderInfo.Symbol() == InpSymbol)
+         if(orderInfo.Symbol() == tradeSym)
             return true;
       }
    }
@@ -1612,7 +1629,7 @@ void LogTrade(string result, double pnl)
    FileWrite(handle,
       TimeToString(TimeCurrent() - 300, TIME_DATE|TIME_MINUTES),
       TimeToString(TimeCurrent(), TIME_DATE|TIME_MINUTES),
-      InpSymbol,
+      tradeSym,
       direction,
       DoubleToString(g_currentLot, 2),
       DoubleToString(g_entryPrice, _Digits),
@@ -1671,7 +1688,7 @@ void LogSetup(string stateReached, string reasonCancel, ENUM_BIAS bias,
 //+------------------------------------------------------------------+
 void DrawLiquidityLevels()
 {
-   datetime startTime = iTime(InpSymbol, PERIOD_D1, 1);
+   datetime startTime = iTime(tradeSym, PERIOD_D1, 1);
    datetime endTime = TimeCurrent() + 3600;
    
    // PDH
@@ -1713,7 +1730,7 @@ void DrawHLine(string name, double price, color clr, ENUM_LINE_STYLE style, stri
 void DrawZone()
 {
    string name = g_objPrefix + "Zone";
-   datetime startTime = iTime(InpSymbol, InpEntryTF, g_zoneBar + 5);
+   datetime startTime = iTime(tradeSym, InpEntryTF, g_zoneBar + 5);
    datetime endTime = TimeCurrent() + 3600;
    
    color zoneColor = (g_zoneType == ZONE_FVG) ? InpColorFVG : InpColorOB;
