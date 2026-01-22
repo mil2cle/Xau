@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v1.9                         |
+//|                    SMC Scalping Bot v2.0                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v1.9"
+#property copyright "SMC Scalping Bot v2.0"
 #property link      ""
-#property version   "1.80"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -78,6 +78,27 @@ enum ENUM_TRADE_MODE
    MODE_RELAX2               // Final relaxed mode (end of day)
 };
 
+enum ENUM_CANCEL_REASON
+{
+   CANCEL_NONE = 0,
+   CANCEL_SPREAD,
+   CANCEL_SPREAD_SPIKE,
+   CANCEL_NO_SWEEP,
+   CANCEL_NO_CHOCH,
+   CANCEL_NO_RETRACE,
+   CANCEL_TIMEFILTER,
+   CANCEL_BIAS_NONE,
+   CANCEL_COOLDOWN,
+   CANCEL_NO_TRADE_ZONE,
+   CANCEL_HARD_BLOCK,
+   CANCEL_SL_BLOCKED,
+   CANCEL_MAX_TRADES_DAY,
+   CANCEL_CONSECUTIVE_LOSSES,
+   CANCEL_DAILY_LOSS,
+   CANCEL_OTHER,
+   CANCEL_COUNT              // Total count of reasons
+};
+
 //=== INPUT PARAMETERS ===
 input group "=== Symbol & Timeframe ==="
 input string   InpTradeSymbol       = "";             // Symbol (empty = use chart symbol)
@@ -127,10 +148,11 @@ input int      InpMaxTradesPerDay    = 30;            // Hard cap trades/day
 input int      InpMinMinutesBetweenTrades = 10;       // Min minutes between trades (reduced from 15)
 
 input group "=== No-Trade Zone (Rollover Quarantine) ==="
-input int      InpNoTradeStartHHMM   = 2300;          // No-trade zone start (HHMM) - default 23:00
-input int      InpNoTradeEndHHMM     = 20;            // No-trade zone end (HHMM) - default 00:20
+input int      InpNoTradeStartHHMM   = 2355;          // No-trade zone start (HHMM) - default 23:55
+input int      InpNoTradeEndHHMM     = 10;            // No-trade zone end (HHMM) - default 00:10
 input bool     InpBlockAllModesInNoTrade = true;      // Block ALL modes in no-trade zone
-input int      InpHardBlockAfterHHMM = 2300;          // Hard block after this time (HHMM) - no new orders
+input bool     InpEnableHardBlock    = false;         // Enable hard block (0=disabled)
+input int      InpHardBlockAfterHHMM = 2300;          // Hard block after this time (HHMM) - only if enabled
 
 input group "=== RELAX Mode ==="
 input bool     InpEnableRelaxMode    = true;          // Enable RELAX mode
@@ -155,7 +177,11 @@ input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRI
 input group "=== Time Filter ==="
 input string   InpTradeStart        = "14:00";        // Trade start time (server)
 input string   InpTradeEnd          = "23:30";        // Trade end time (server)
-input bool     InpEnable24hTrading  = false;          // Enable 24h trading (still respects rollover)
+input bool     InpEnable24hTrading  = true;           // Enable 24h trading (default ON, respects rollover)
+
+input group "=== CSV Logging ==="
+input bool     InpEnableCSVLogging  = true;           // Enable daily CSV logging
+input string   InpCSVFolder         = "SMC_Scalp_Logs"; // CSV folder name
 
 input group "=== Martingale ==="
 input ENUM_MARTINGALE_MODE InpMartingaleMode = MART_AFTER_LOSS; // Martingale mode
@@ -276,23 +302,22 @@ int            g_currentSpreadLimit = 0;   // Current spread limit for display
 string         g_lastCancelReason = "";
 datetime       g_lastCancelTime = 0;
 
-// Cancel Counters (daily statistics)
-int            g_cancelSpread = 0;
-int            g_cancelSpreadSpike = 0;
-int            g_cancelTimefilter = 0;
-int            g_cancelRollover = 0;
-int            g_cancelNoSweep = 0;
-int            g_cancelNoChoch = 0;
-int            g_cancelNoRetrace = 0;
-int            g_cancelBiasNone = 0;
-int            g_cancelCooldown = 0;
-int            g_cancelMaxTrades = 0;
-int            g_cancelSlBlocked = 0;
-int            g_cancelHardBlock = 0;
-int            g_cancelNoTradeZone = 0;
-int            g_cancelConsecLosses = 0;
-int            g_cancelDailyLoss = 0;
+// Cancel Counters (daily statistics) - using array indexed by ENUM_CANCEL_REASON
+int            g_cancelCounters[CANCEL_COUNT];     // Daily counters
+int            g_totalCancelCounters[CANCEL_COUNT]; // Total counters for final summary
+datetime       g_lastCancelBarTime[CANCEL_COUNT];  // Per-bar throttle: last bar time counted
+ENUM_CANCEL_REASON g_lastCancelReasonEnum = CANCEL_NONE; // Last cancel reason as enum
 bool           g_dailyLossDisabledLogged = false;  // Log once when disabled
+
+// Period tracking for final summary
+int            g_totalTradingDays = 0;
+int            g_totalTradesExecuted = 0;
+double         g_totalPnL = 0;
+int            g_totalSlHits = 0;
+
+// CSV file handle
+int            g_csvFileHandle = INVALID_HANDLE;
+string         g_csvFileName = "";
 
 // Note: RELAX mode parameters are now controlled via input parameters
 // InpRelaxSweepBreakPoints, InpRelaxRollingLiqBars, InpRelax2SweepBreakPoints, etc.
@@ -368,6 +393,22 @@ int OnInit()
    g_spreadHistoryIdx = 0;
    g_avgSpread = 0;
    
+   // Initialize cancel counters
+   ArrayInitialize(g_cancelCounters, 0);
+   ArrayInitialize(g_totalCancelCounters, 0);
+   ArrayInitialize(g_lastCancelBarTime, 0);
+   g_lastCancelReasonEnum = CANCEL_NONE;
+   g_totalTradingDays = 0;
+   g_totalTradesExecuted = 0;
+   g_totalPnL = 0;
+   g_totalSlHits = 0;
+   
+   // Initialize CSV logging
+   if(InpEnableCSVLogging)
+   {
+      InitCSVLogging();
+   }
+   
    // Set timer for periodic updates
    EventSetTimer(1);
    
@@ -375,14 +416,15 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v1.9 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v2.0 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
    Print("Target Trades: ", InpTargetTradesPerDay, " | Max Trades: ", InpMaxTradesPerDay, " | Cooldown: ", InpMinMinutesBetweenTrades, "m");
    Print("RELAX: ", InpEnableRelaxMode, " @", InpRelaxSwitchHour, ":00 | Sweep: ", InpRelaxSweepBreakPoints, "pts | RollingLiq: ", InpRelaxRollingLiqBars, "bars");
    Print("RELAX2: ", InpEnableRelax2, " @", InpRelax2Hour, ":00 | Sweep: ", InpRelax2SweepBreakPoints, "pts | RollingLiq: ", InpRelax2RollingLiqBars, "bars");
-   Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Martingale STRICT only: ", InpMartingaleStrictOnly);
+   Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Hard Block: ", InpEnableHardBlock ? StringFormat("%04d", InpHardBlockAfterHHMM) : "OFF");
+   Print("24h Trading: ", InpEnable24hTrading, " | CSV Logging: ", InpEnableCSVLogging);
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
    
    return(INIT_SUCCEEDED);
@@ -394,6 +436,20 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   
+   // Print final daily summary before exit
+   PrintDailySummary();
+   
+   // Print FINAL SUMMARY (period summary)
+   PrintFinalSummary();
+   
+   // Write final CSV entry
+   if(InpEnableCSVLogging)
+   {
+      WriteCSVDailyEntry();
+      if(g_csvFileHandle != INVALID_HANDLE)
+         FileClose(g_csvFileHandle);
+   }
    
    // Release EMA indicator
    if(g_emaHandle != INVALID_HANDLE)
@@ -408,7 +464,7 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v2.0 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -1842,6 +1898,10 @@ bool IsInNoTradeZone()
 //+------------------------------------------------------------------+
 bool IsHardBlockTime()
 {
+   // If hard block is disabled, always return false
+   if(!InpEnableHardBlock)
+      return false;
+   
    int currentHHMM = GetCurrentHHMM();
    
    // Hard block after specified time until midnight
@@ -2427,86 +2487,101 @@ void LogSpreadCancel(string reason, double curSpread, double avgSpread, int limi
 }
 
 //+------------------------------------------------------------------+
-//| Increment cancel counter by reason                                  |
+//| Get cancel reason name from enum                                    |
+//+------------------------------------------------------------------+
+string GetCancelReasonName(ENUM_CANCEL_REASON reason)
+{
+   switch(reason)
+   {
+      case CANCEL_SPREAD:            return "spread";
+      case CANCEL_SPREAD_SPIKE:      return "spread_spike";
+      case CANCEL_NO_SWEEP:          return "no_sweep";
+      case CANCEL_NO_CHOCH:          return "no_choch";
+      case CANCEL_NO_RETRACE:        return "no_retrace";
+      case CANCEL_TIMEFILTER:        return "timefilter";
+      case CANCEL_BIAS_NONE:         return "bias_none";
+      case CANCEL_COOLDOWN:          return "cooldown";
+      case CANCEL_NO_TRADE_ZONE:     return "no_trade_zone";
+      case CANCEL_HARD_BLOCK:        return "hard_block";
+      case CANCEL_SL_BLOCKED:        return "sl_blocked";
+      case CANCEL_MAX_TRADES_DAY:    return "max_trades";
+      case CANCEL_CONSECUTIVE_LOSSES: return "consec_losses";
+      case CANCEL_DAILY_LOSS:        return "daily_loss";
+      case CANCEL_OTHER:             return "other";
+      default:                       return "unknown";
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Record cancel reason with per-bar throttle                          |
+//| Counts max 1 time per bar per reason to avoid inflated numbers      |
+//+------------------------------------------------------------------+
+void RecordCancel(ENUM_CANCEL_REASON reason)
+{
+   if(reason == CANCEL_NONE || reason >= CANCEL_COUNT) return;
+   
+   // Update last cancel reason for panel
+   g_lastCancelReasonEnum = reason;
+   g_lastCancelReason = GetCancelReasonName(reason);
+   g_lastCancelTime = TimeCurrent();
+   
+   // Per-bar throttle: only count once per bar per reason
+   datetime currentBarTime = iTime(tradeSym, InpEntryTF, 0);
+   if(g_lastCancelBarTime[reason] == currentBarTime)
+      return;  // Already counted this bar
+   
+   g_lastCancelBarTime[reason] = currentBarTime;
+   g_cancelCounters[reason]++;
+   
+   // Throttled logging (60 sec per reason)
+   static datetime lastLogTimes[CANCEL_COUNT];
+   if(InpEnableLogging && (TimeCurrent() - lastLogTimes[reason] >= 60))
+   {
+      lastLogTimes[reason] = TimeCurrent();
+      Print(StringFormat("[%s] Cancel: %s (count: %d)", 
+            EnumToString(g_tradeMode), g_lastCancelReason, g_cancelCounters[reason]));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Legacy wrapper for string-based cancel recording                    |
 //+------------------------------------------------------------------+
 void IncrementCancelCounter(string reason)
 {
-   g_lastCancelReason = reason;
-   g_lastCancelTime = TimeCurrent();
+   ENUM_CANCEL_REASON enumReason = CANCEL_OTHER;
    
-   if(reason == "spread") g_cancelSpread++;
-   else if(reason == "spread_spike") g_cancelSpreadSpike++;
-   else if(reason == "timefilter") g_cancelTimefilter++;
-   else if(reason == "rollover") g_cancelRollover++;
-   else if(reason == "no_sweep") g_cancelNoSweep++;
-   else if(reason == "no_choch") g_cancelNoChoch++;
-   else if(reason == "no_retrace") g_cancelNoRetrace++;
-   else if(reason == "bias_none") g_cancelBiasNone++;
-   else if(reason == "cooldown") g_cancelCooldown++;
-   else if(reason == "max_trades") g_cancelMaxTrades++;
-   else if(reason == "sl_blocked") g_cancelSlBlocked++;
-   else if(reason == "hard_block") g_cancelHardBlock++;
-   else if(reason == "no_trade_zone") g_cancelNoTradeZone++;
-   else if(reason == "consec_losses") g_cancelConsecLosses++;
-   else if(reason == "daily_loss") g_cancelDailyLoss++;
+   if(reason == "spread") enumReason = CANCEL_SPREAD;
+   else if(reason == "spread_spike") enumReason = CANCEL_SPREAD_SPIKE;
+   else if(reason == "no_sweep") enumReason = CANCEL_NO_SWEEP;
+   else if(reason == "no_choch") enumReason = CANCEL_NO_CHOCH;
+   else if(reason == "no_retrace") enumReason = CANCEL_NO_RETRACE;
+   else if(reason == "timefilter") enumReason = CANCEL_TIMEFILTER;
+   else if(reason == "bias_none") enumReason = CANCEL_BIAS_NONE;
+   else if(reason == "cooldown") enumReason = CANCEL_COOLDOWN;
+   else if(reason == "no_trade_zone") enumReason = CANCEL_NO_TRADE_ZONE;
+   else if(reason == "hard_block") enumReason = CANCEL_HARD_BLOCK;
+   else if(reason == "sl_blocked") enumReason = CANCEL_SL_BLOCKED;
+   else if(reason == "max_trades") enumReason = CANCEL_MAX_TRADES_DAY;
+   else if(reason == "consec_losses") enumReason = CANCEL_CONSECUTIVE_LOSSES;
+   else if(reason == "daily_loss") enumReason = CANCEL_DAILY_LOSS;
+   
+   RecordCancel(enumReason);
 }
 
 //+------------------------------------------------------------------+
-//| Log cancel reason with throttle (60 sec per reason)                 |
+//| Legacy wrapper for throttled logging                                |
 //+------------------------------------------------------------------+
 void LogCancelReasonThrottled(string reason)
 {
-   if(!InpEnableLogging) return;
-   
-   // Rate limit logging to avoid spam - 60 seconds per unique reason
-   static datetime lastLogTimes[];  // Array of last log times per reason
-   static string lastReasons[];     // Array of reasons
-   static int reasonCount = 0;
-   
-   // Find or add reason
-   int idx = -1;
-   for(int i = 0; i < reasonCount; i++)
-   {
-      if(lastReasons[i] == reason)
-      {
-         idx = i;
-         break;
-      }
-   }
-   
-   if(idx < 0)
-   {
-      // Add new reason
-      reasonCount++;
-      ArrayResize(lastLogTimes, reasonCount);
-      ArrayResize(lastReasons, reasonCount);
-      idx = reasonCount - 1;
-      lastReasons[idx] = reason;
-      lastLogTimes[idx] = 0;
-   }
-   
-   // Check throttle
-   if(TimeCurrent() - lastLogTimes[idx] < 60)
-      return;
-   
-   lastLogTimes[idx] = TimeCurrent();
-   
-   // Short log format
-   Print(StringFormat("[%s] Cancel: %s", EnumToString(g_tradeMode), reason));
+   IncrementCancelCounter(reason);  // Now uses RecordCancel internally
 }
 
 //+------------------------------------------------------------------+
-//| Log cancel reason (short form, no throttle)                         |
+//| Legacy wrapper for logging (no throttle - but now uses per-bar)     |
 //+------------------------------------------------------------------+
 void LogCancelReason(string reason)
 {
-   // Update last cancel reason for panel
-   g_lastCancelReason = reason;
-   g_lastCancelTime = TimeCurrent();
-   if(!InpEnableLogging) return;
-   
-   // Short log format: timestamp | mode | reason
-   Print(StringFormat("[%s] Cancel: %s", EnumToString(g_tradeMode), reason));
+   IncrementCancelCounter(reason);  // Now uses RecordCancel internally
 }
 
 //=== UTILITY FUNCTIONS ===
@@ -2656,9 +2731,31 @@ void CheckNewDay()
 void ResetDailyCounters()
 {
    // Print daily summary before reset (if we have data)
-   if(g_tradesToday > 0 || g_cancelSpread > 0 || g_cancelNoSweep > 0)
+   bool hasData = (g_tradesToday > 0);
+   for(int i = 0; i < CANCEL_COUNT && !hasData; i++)
+   {
+      if(g_cancelCounters[i] > 0) hasData = true;
+   }
+   
+   if(hasData)
    {
       PrintDailySummary();
+      
+      // Write CSV entry before reset
+      if(InpEnableCSVLogging)
+         WriteCSVDailyEntry();
+      
+      // Accumulate totals for final summary
+      g_totalTradingDays++;
+      g_totalTradesExecuted += g_tradesToday;
+      g_totalPnL += g_dailyPnL;
+      g_totalSlHits += g_slHitsToday;
+      
+      // Add daily counters to total counters
+      for(int i = 0; i < CANCEL_COUNT; i++)
+      {
+         g_totalCancelCounters[i] += g_cancelCounters[i];
+      }
    }
    
    g_tradesToday = 0;
@@ -2672,22 +2769,10 @@ void ResetDailyCounters()
    g_tradeMode = MODE_STRICT;
    g_prevTradeMode = MODE_STRICT;
    
-   // Reset cancel counters
-   g_cancelSpread = 0;
-   g_cancelSpreadSpike = 0;
-   g_cancelTimefilter = 0;
-   g_cancelRollover = 0;
-   g_cancelNoSweep = 0;
-   g_cancelNoChoch = 0;
-   g_cancelNoRetrace = 0;
-   g_cancelBiasNone = 0;
-   g_cancelCooldown = 0;
-   g_cancelMaxTrades = 0;
-   g_cancelSlBlocked = 0;
-   g_cancelHardBlock = 0;
-   g_cancelNoTradeZone = 0;
-   g_cancelConsecLosses = 0;
-   g_cancelDailyLoss = 0;
+   // Reset cancel counters (array-based)
+   ArrayInitialize(g_cancelCounters, 0);
+   ArrayInitialize(g_lastCancelBarTime, 0);
+   g_lastCancelReasonEnum = CANCEL_NONE;
    g_dailyLossDisabledLogged = false;
    
    Print("=== DAILY RESET ===");
@@ -2704,23 +2789,124 @@ void PrintDailySummary()
    Print("Trades executed: ", g_tradesToday);
    Print("SL Hits: ", g_slHitsToday, "/", InpMaxSLHitsPerDay);
    Print("Daily PnL: ", DoubleToString(g_dailyPnL, 2));
-   Print("--- Cancel Reasons ---");
-   if(g_cancelSpread > 0) Print("  spread: ", g_cancelSpread);
-   if(g_cancelSpreadSpike > 0) Print("  spread_spike: ", g_cancelSpreadSpike);
-   if(g_cancelTimefilter > 0) Print("  timefilter: ", g_cancelTimefilter);
-   if(g_cancelRollover > 0) Print("  rollover: ", g_cancelRollover);
-   if(g_cancelNoTradeZone > 0) Print("  no_trade_zone: ", g_cancelNoTradeZone);
-   if(g_cancelHardBlock > 0) Print("  hard_block: ", g_cancelHardBlock);
-   if(g_cancelNoSweep > 0) Print("  no_sweep: ", g_cancelNoSweep);
-   if(g_cancelNoChoch > 0) Print("  no_choch: ", g_cancelNoChoch);
-   if(g_cancelNoRetrace > 0) Print("  no_retrace: ", g_cancelNoRetrace);
-   if(g_cancelBiasNone > 0) Print("  bias_none: ", g_cancelBiasNone);
-   if(g_cancelCooldown > 0) Print("  cooldown: ", g_cancelCooldown);
-   if(g_cancelMaxTrades > 0) Print("  max_trades: ", g_cancelMaxTrades);
-   if(g_cancelSlBlocked > 0) Print("  sl_blocked: ", g_cancelSlBlocked);
-   if(g_cancelConsecLosses > 0) Print("  consec_losses: ", g_cancelConsecLosses);
-   if(g_cancelDailyLoss > 0) Print("  daily_loss: ", g_cancelDailyLoss);
+   Print("--- Cancel Reasons (sorted by count) ---");
+   
+   // Sort and print cancel reasons by count (descending)
+   int sortedIdx[];
+   int sortedCounts[];
+   ArrayResize(sortedIdx, CANCEL_COUNT);
+   ArrayResize(sortedCounts, CANCEL_COUNT);
+   
+   for(int i = 0; i < CANCEL_COUNT; i++)
+   {
+      sortedIdx[i] = i;
+      sortedCounts[i] = g_cancelCounters[i];
+   }
+   
+   // Simple bubble sort by count descending
+   for(int i = 0; i < CANCEL_COUNT - 1; i++)
+   {
+      for(int j = i + 1; j < CANCEL_COUNT; j++)
+      {
+         if(sortedCounts[j] > sortedCounts[i])
+         {
+            int tmpIdx = sortedIdx[i];
+            int tmpCnt = sortedCounts[i];
+            sortedIdx[i] = sortedIdx[j];
+            sortedCounts[i] = sortedCounts[j];
+            sortedIdx[j] = tmpIdx;
+            sortedCounts[j] = tmpCnt;
+         }
+      }
+   }
+   
+   // Print only non-zero counts
+   for(int i = 0; i < CANCEL_COUNT; i++)
+   {
+      if(sortedCounts[i] > 0)
+      {
+         Print("  ", GetCancelReasonName((ENUM_CANCEL_REASON)sortedIdx[i]), ": ", sortedCounts[i]);
+      }
+   }
    Print("====================");
+}
+
+//+------------------------------------------------------------------+
+//| Print final summary (period summary)                               |
+//+------------------------------------------------------------------+
+void PrintFinalSummary()
+{
+   // Include current day in totals if not yet reset
+   int totalDays = g_totalTradingDays;
+   int totalTrades = g_totalTradesExecuted + g_tradesToday;
+   double totalPnL = g_totalPnL + g_dailyPnL;
+   int totalSL = g_totalSlHits + g_slHitsToday;
+   
+   // Add current day's cancel counters to totals for display
+   int finalCounters[CANCEL_COUNT];
+   for(int i = 0; i < CANCEL_COUNT; i++)
+   {
+      finalCounters[i] = g_totalCancelCounters[i] + g_cancelCounters[i];
+   }
+   
+   if(totalDays == 0 && g_tradesToday > 0)
+      totalDays = 1;
+   
+   Print("========================================");
+   Print("=== FINAL SUMMARY (Period Statistics) ===");
+   Print("========================================");
+   Print("Total trading days: ", totalDays);
+   Print("Total trades executed: ", totalTrades);
+   Print("Average trades/day: ", totalDays > 0 ? DoubleToString((double)totalTrades / totalDays, 2) : "0");
+   Print("Total SL hits: ", totalSL);
+   Print("Total PnL: ", DoubleToString(totalPnL, 2));
+   Print("");
+   Print("--- Top 5 Cancel Reasons (All Time) ---");
+   
+   // Sort and print top 5 cancel reasons
+   int sortedIdx[];
+   int sortedCounts[];
+   ArrayResize(sortedIdx, CANCEL_COUNT);
+   ArrayResize(sortedCounts, CANCEL_COUNT);
+   
+   for(int i = 0; i < CANCEL_COUNT; i++)
+   {
+      sortedIdx[i] = i;
+      sortedCounts[i] = finalCounters[i];
+   }
+   
+   // Simple bubble sort by count descending
+   for(int i = 0; i < CANCEL_COUNT - 1; i++)
+   {
+      for(int j = i + 1; j < CANCEL_COUNT; j++)
+      {
+         if(sortedCounts[j] > sortedCounts[i])
+         {
+            int tmpIdx = sortedIdx[i];
+            int tmpCnt = sortedCounts[i];
+            sortedIdx[i] = sortedIdx[j];
+            sortedCounts[i] = sortedCounts[j];
+            sortedIdx[j] = tmpIdx;
+            sortedCounts[j] = tmpCnt;
+         }
+      }
+   }
+   
+   // Print top 5
+   for(int i = 0; i < 5 && i < CANCEL_COUNT; i++)
+   {
+      if(sortedCounts[i] > 0)
+      {
+         double pct = 0;
+         int totalCancels = 0;
+         for(int j = 0; j < CANCEL_COUNT; j++) totalCancels += finalCounters[j];
+         if(totalCancels > 0) pct = (double)sortedCounts[i] / totalCancels * 100;
+         
+         Print("  ", i+1, ". ", GetCancelReasonName((ENUM_CANCEL_REASON)sortedIdx[i]), 
+               ": ", sortedCounts[i], " (", DoubleToString(pct, 1), "%)");
+      }
+   }
+   Print("========================================");
 }
 
 //+------------------------------------------------------------------+
@@ -2810,6 +2996,96 @@ void InitLogging()
          "distance_to_tp1_points");
       FileClose(g_setupsFileHandle);
    }
+}
+
+//+------------------------------------------------------------------+
+//| Initialize CSV logging for daily summary                           |
+//+------------------------------------------------------------------+
+void InitCSVLogging()
+{
+   // Create folder if needed
+   FolderCreate(InpCSVFolder, FILE_COMMON);
+   
+   // Create filename with date
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   g_csvFileName = StringFormat("%s/daily_summary_%04d%02d.csv", 
+                                InpCSVFolder, dt.year, dt.mon);
+   
+   // Check if file exists, if not create with header
+   g_csvFileHandle = FileOpen(g_csvFileName, FILE_READ|FILE_CSV|FILE_COMMON);
+   if(g_csvFileHandle == INVALID_HANDLE)
+   {
+      // Create new file with header
+      g_csvFileHandle = FileOpen(g_csvFileName, FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+      if(g_csvFileHandle != INVALID_HANDLE)
+      {
+         FileWrite(g_csvFileHandle,
+            "date", "trades", "sl_hits", "pnl", "start_equity", "end_equity",
+            "cancel_spread", "cancel_spike", "cancel_no_sweep", "cancel_no_choch",
+            "cancel_no_retrace", "cancel_timefilter", "cancel_bias_none",
+            "cancel_cooldown", "cancel_no_trade_zone", "cancel_hard_block",
+            "cancel_sl_blocked", "cancel_max_trades", "cancel_consec_losses",
+            "cancel_daily_loss", "cancel_other");
+         FileClose(g_csvFileHandle);
+      }
+   }
+   else
+   {
+      FileClose(g_csvFileHandle);
+   }
+   
+   Print("CSV logging initialized: ", g_csvFileName);
+}
+
+//+------------------------------------------------------------------+
+//| Write daily entry to CSV                                           |
+//+------------------------------------------------------------------+
+void WriteCSVDailyEntry()
+{
+   if(!InpEnableCSVLogging) return;
+   
+   // Open file for append
+   int handle = FileOpen(g_csvFileName, FILE_READ|FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      Print("Error opening CSV file for writing: ", GetLastError());
+      return;
+   }
+   
+   FileSeek(handle, 0, SEEK_END);
+   
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string dateStr = StringFormat("%04d-%02d-%02d", dt.year, dt.mon, dt.day);
+   
+   double endEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   FileWrite(handle,
+      dateStr,
+      g_tradesToday,
+      g_slHitsToday,
+      DoubleToString(g_dailyPnL, 2),
+      DoubleToString(g_dailyStartEquity, 2),
+      DoubleToString(endEquity, 2),
+      g_cancelCounters[CANCEL_SPREAD],
+      g_cancelCounters[CANCEL_SPREAD_SPIKE],
+      g_cancelCounters[CANCEL_NO_SWEEP],
+      g_cancelCounters[CANCEL_NO_CHOCH],
+      g_cancelCounters[CANCEL_NO_RETRACE],
+      g_cancelCounters[CANCEL_TIMEFILTER],
+      g_cancelCounters[CANCEL_BIAS_NONE],
+      g_cancelCounters[CANCEL_COOLDOWN],
+      g_cancelCounters[CANCEL_NO_TRADE_ZONE],
+      g_cancelCounters[CANCEL_HARD_BLOCK],
+      g_cancelCounters[CANCEL_SL_BLOCKED],
+      g_cancelCounters[CANCEL_MAX_TRADES_DAY],
+      g_cancelCounters[CANCEL_CONSECUTIVE_LOSSES],
+      g_cancelCounters[CANCEL_DAILY_LOSS],
+      g_cancelCounters[CANCEL_OTHER]);
+   
+   FileClose(handle);
+   Print("CSV daily entry written for ", dateStr);
 }
 
 //+------------------------------------------------------------------+
@@ -2989,7 +3265,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.9", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.0", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
@@ -3064,14 +3340,63 @@ void UpdatePanel()
    string switchInfo = StringFormat("R@%d R2@%d Block@%04d (Now:%d)", InpRelaxSwitchHour, InpRelax2Hour, InpHardBlockAfterHHMM, dt.hour);
    CreateLabel(panelName + "13", x, y + lineHeight*13, switchInfo, clrGray);
    
-   // Cancel counters (compact format)
-   string cancelStats1 = StringFormat("Cnl: sprd=%d spk=%d tf=%d roll=%d", 
-                                      g_cancelSpread, g_cancelSpreadSpike, g_cancelTimefilter, g_cancelRollover);
-   CreateLabel(panelName + "14", x, y + lineHeight*14, cancelStats1, clrGray);
+   // Cancel counters - Top 3 (sorted by count)
+   string top3Str = GetTop3CancelReasons();
+   CreateLabel(panelName + "14", x, y + lineHeight*14, "Top3: " + top3Str, clrGray);
    
-   string cancelStats2 = StringFormat("     swp=%d choch=%d retr=%d bias=%d", 
-                                      g_cancelNoSweep, g_cancelNoChoch, g_cancelNoRetrace, g_cancelBiasNone);
-   CreateLabel(panelName + "15", x, y + lineHeight*15, cancelStats2, clrGray);
+   // Total cancel count today
+   int totalCancels = 0;
+   for(int i = 0; i < CANCEL_COUNT; i++) totalCancels += g_cancelCounters[i];
+   CreateLabel(panelName + "15", x, y + lineHeight*15, StringFormat("TotalCancels: %d", totalCancels), clrGray);
+}
+
+//+------------------------------------------------------------------+
+//| Get top 3 cancel reasons as string                                 |
+//+------------------------------------------------------------------+
+string GetTop3CancelReasons()
+{
+   // Sort cancel counters
+   int sortedIdx[];
+   int sortedCounts[];
+   ArrayResize(sortedIdx, CANCEL_COUNT);
+   ArrayResize(sortedCounts, CANCEL_COUNT);
+   
+   for(int i = 0; i < CANCEL_COUNT; i++)
+   {
+      sortedIdx[i] = i;
+      sortedCounts[i] = g_cancelCounters[i];
+   }
+   
+   // Simple bubble sort by count descending
+   for(int i = 0; i < CANCEL_COUNT - 1; i++)
+   {
+      for(int j = i + 1; j < CANCEL_COUNT; j++)
+      {
+         if(sortedCounts[j] > sortedCounts[i])
+         {
+            int tmpIdx = sortedIdx[i];
+            int tmpCnt = sortedCounts[i];
+            sortedIdx[i] = sortedIdx[j];
+            sortedCounts[i] = sortedCounts[j];
+            sortedIdx[j] = tmpIdx;
+            sortedCounts[j] = tmpCnt;
+         }
+      }
+   }
+   
+   // Build top 3 string
+   string result = "";
+   for(int i = 0; i < 3 && i < CANCEL_COUNT; i++)
+   {
+      if(sortedCounts[i] > 0)
+      {
+         if(result != "") result += " ";
+         result += StringFormat("%s=%d", GetCancelReasonName((ENUM_CANCEL_REASON)sortedIdx[i]), sortedCounts[i]);
+      }
+   }
+   
+   if(result == "") result = "-";
+   return result;
 }
 
 //+------------------------------------------------------------------+
