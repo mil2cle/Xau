@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v1.8                         |
+//|                    SMC Scalping Bot v1.9                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v1.8"
+#property copyright "SMC Scalping Bot v1.9"
 #property link      ""
 #property version   "1.80"
 #property strict
@@ -124,7 +124,7 @@ input bool     InpStopTradingOnSLHits = true;         // Stop trading after max 
 input group "=== Frequency Boost (Tiered RELAX) ==="
 input int      InpTargetTradesPerDay = 3;             // Soft target trades/day (2-3)
 input int      InpMaxTradesPerDay    = 30;            // Hard cap trades/day
-input int      InpMinMinutesBetweenTrades = 15;       // Min minutes between trades (cooldown)
+input int      InpMinMinutesBetweenTrades = 10;       // Min minutes between trades (reduced from 15)
 
 input group "=== No-Trade Zone (Rollover Quarantine) ==="
 input int      InpNoTradeStartHHMM   = 2300;          // No-trade zone start (HHMM) - default 23:00
@@ -134,19 +134,19 @@ input int      InpHardBlockAfterHHMM = 2300;          // Hard block after this t
 
 input group "=== RELAX Mode ==="
 input bool     InpEnableRelaxMode    = true;          // Enable RELAX mode
-input int      InpRelaxSwitchHour    = 16;            // Switch to RELAX after this hour
+input int      InpRelaxSwitchHour    = 15;            // Switch to RELAX after this hour (earlier = more time)
 input double   InpRelaxLotFactor     = 0.5;           // RELAX lot factor (reduce lot)
 input bool     InpRelaxAllowBiasNone = true;          // RELAX allows bias=none
 input bool     InpRelaxIgnoreTimeFilter = true;       // RELAX ignores timefilter when below target
-input int      InpRelaxSweepBreakPoints = 15;         // RELAX sweep break points (default 15)
-input int      InpRelaxRollingLiqBars   = 48;         // RELAX rolling liquidity bars (default 48)
+input int      InpRelaxSweepBreakPoints = 12;         // RELAX sweep break points (reduced from 15)
+input int      InpRelaxRollingLiqBars   = 36;         // RELAX rolling liquidity bars (reduced from 48)
 
 input group "=== RELAX2 Mode (End of Day) ==="
-input bool     InpEnableRelax2       = false;         // Enable RELAX2 mode (default OFF for safety)
-input int      InpRelax2Hour         = 21;            // Switch to RELAX2 after this hour
+input bool     InpEnableRelax2       = true;          // Enable RELAX2 mode (ON for more frequency)
+input int      InpRelax2Hour         = 20;            // Switch to RELAX2 after this hour (earlier)
 input double   InpRelax2LotFactor    = 0.3;           // RELAX2 lot factor (more reduced)
-input int      InpRelax2SweepBreakPoints = 12;        // RELAX2 sweep break points
-input int      InpRelax2RollingLiqBars   = 36;        // RELAX2 rolling liquidity bars
+input int      InpRelax2SweepBreakPoints = 10;        // RELAX2 sweep break points (reduced)
+input int      InpRelax2RollingLiqBars   = 24;        // RELAX2 rolling liquidity bars (reduced)
 input bool     InpRelax2AllowBiasNone    = true;      // RELAX2 allows bias=none
 
 input group "=== Martingale ==="
@@ -155,6 +155,7 @@ input bool     InpMartingaleStrictOnly = true;        // Martingale only in STRI
 input group "=== Time Filter ==="
 input string   InpTradeStart        = "14:00";        // Trade start time (server)
 input string   InpTradeEnd          = "23:30";        // Trade end time (server)
+input bool     InpEnable24hTrading  = false;          // Enable 24h trading (still respects rollover)
 
 input group "=== Martingale ==="
 input ENUM_MARTINGALE_MODE InpMartingaleMode = MART_AFTER_LOSS; // Martingale mode
@@ -275,6 +276,24 @@ int            g_currentSpreadLimit = 0;   // Current spread limit for display
 string         g_lastCancelReason = "";
 datetime       g_lastCancelTime = 0;
 
+// Cancel Counters (daily statistics)
+int            g_cancelSpread = 0;
+int            g_cancelSpreadSpike = 0;
+int            g_cancelTimefilter = 0;
+int            g_cancelRollover = 0;
+int            g_cancelNoSweep = 0;
+int            g_cancelNoChoch = 0;
+int            g_cancelNoRetrace = 0;
+int            g_cancelBiasNone = 0;
+int            g_cancelCooldown = 0;
+int            g_cancelMaxTrades = 0;
+int            g_cancelSlBlocked = 0;
+int            g_cancelHardBlock = 0;
+int            g_cancelNoTradeZone = 0;
+int            g_cancelConsecLosses = 0;
+int            g_cancelDailyLoss = 0;
+bool           g_dailyLossDisabledLogged = false;  // Log once when disabled
+
 // Note: RELAX mode parameters are now controlled via input parameters
 // InpRelaxSweepBreakPoints, InpRelaxRollingLiqBars, InpRelax2SweepBreakPoints, etc.
 
@@ -356,7 +375,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v1.8 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v1.9 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -1629,10 +1648,18 @@ bool PassRiskChecks()
 {
    int currentHHMM = GetCurrentHHMM();
    
-   // Check hard block first (after InpHardBlockAfterHHMM)
+   // Check SL blocked first (highest priority)
+   if(g_blockedToday && InpStopTradingOnSLHits)
+   {
+      IncrementCancelCounter("sl_blocked");
+      return false;
+   }
+   
+   // Check hard block (after InpHardBlockAfterHHMM)
    if(IsHardBlockTime())
    {
       LogNoTradeZoneCancel("hard_block_after", currentHHMM);
+      IncrementCancelCounter("hard_block");
       return false;
    }
    
@@ -1640,13 +1667,15 @@ bool PassRiskChecks()
    if(InpBlockAllModesInNoTrade && IsInNoTradeZone())
    {
       LogNoTradeZoneCancel("no_trade_zone", currentHHMM);
+      IncrementCancelCounter("no_trade_zone");
       return false;
    }
    
    // Time filter with RELAX mode support
    if(!CheckTradingTime())
    {
-      LogCancelReason("timefilter");
+      LogCancelReasonThrottled("timefilter");
+      IncrementCancelCounter("timefilter");
       return false;
    }
    
@@ -1656,7 +1685,8 @@ bool PassRiskChecks()
       int minutesSinceLastTrade = (int)((TimeCurrent() - g_lastTradeTime) / 60);
       if(minutesSinceLastTrade < InpMinMinutesBetweenTrades)
       {
-         LogCancelReason(StringFormat("cooldown_%dm", InpMinMinutesBetweenTrades - minutesSinceLastTrade));
+         LogCancelReasonThrottled("cooldown");
+         IncrementCancelCounter("cooldown");
          return false;
       }
    }
@@ -1672,6 +1702,7 @@ bool PassRiskChecks()
    if(spreadPoints > spreadLimit)
    {
       LogSpreadCancel("spread", spreadPoints, g_avgSpread, spreadLimit);
+      IncrementCancelCounter("spread");
       return false;
    }
    
@@ -1679,31 +1710,44 @@ bool PassRiskChecks()
    if(IsSpreadSpiking(spreadPoints))
    {
       LogSpreadCancel("spread_spike", spreadPoints, g_avgSpread, spreadLimit);
+      IncrementCancelCounter("spread_spike");
       return false;
    }
    
    // Max trades per day
    if(g_tradesToday >= InpMaxTradesPerDay)
    {
-      LogCancelReason("max_trades");
+      LogCancelReasonThrottled("max_trades");
+      IncrementCancelCounter("max_trades");
       return false;
    }
    
    // Consecutive losses
    if(g_consecLosses >= InpMaxConsecLosses)
    {
-      LogCancelReason("consec_losses");
+      LogCancelReasonThrottled("consec_losses");
+      IncrementCancelCounter("consec_losses");
       return false;
    }
    
-   // Daily loss limit (skip if InpDailyLossLimitPct = 0, meaning disabled)
+   // Daily loss limit (skip if InpDailyLossLimitPct <= 0, meaning disabled)
    if(InpDailyLossLimitPct > 0)
    {
       double dailyLossLimit = g_dailyStartEquity * InpDailyLossLimitPct / 100.0;
       if(g_dailyPnL <= -dailyLossLimit)
       {
-         LogCancelReason("daily_loss");
+         LogCancelReasonThrottled("daily_loss");
+         IncrementCancelCounter("daily_loss");
          return false;
+      }
+   }
+   else
+   {
+      // Log once that daily loss limit is disabled
+      if(!g_dailyLossDisabledLogged)
+      {
+         Print("[INFO] Daily loss limit disabled (InpDailyLossLimitPct <= 0)");
+         g_dailyLossDisabledLogged = true;
       }
    }
    
@@ -1812,6 +1856,8 @@ bool IsHardBlockTime()
 bool CheckTradingTime()
 {
    // Always block no-trade zone (rollover quarantine) for ALL modes
+   // This is checked separately in PassRiskChecks for proper logging
+   // But we double-check here for safety
    if(InpBlockAllModesInNoTrade && IsInNoTradeZone())
    {
       return false;
@@ -1821,6 +1867,12 @@ bool CheckTradingTime()
    if(IsHardBlockTime())
    {
       return false;
+   }
+   
+   // 24h trading mode: allow all times except rollover (already checked above)
+   if(InpEnable24hTrading)
+   {
+      return true;
    }
    
    // MODE_STRICT: use original timefilter
@@ -2375,7 +2427,76 @@ void LogSpreadCancel(string reason, double curSpread, double avgSpread, int limi
 }
 
 //+------------------------------------------------------------------+
-//| Log cancel reason (short form)                                     |
+//| Increment cancel counter by reason                                  |
+//+------------------------------------------------------------------+
+void IncrementCancelCounter(string reason)
+{
+   g_lastCancelReason = reason;
+   g_lastCancelTime = TimeCurrent();
+   
+   if(reason == "spread") g_cancelSpread++;
+   else if(reason == "spread_spike") g_cancelSpreadSpike++;
+   else if(reason == "timefilter") g_cancelTimefilter++;
+   else if(reason == "rollover") g_cancelRollover++;
+   else if(reason == "no_sweep") g_cancelNoSweep++;
+   else if(reason == "no_choch") g_cancelNoChoch++;
+   else if(reason == "no_retrace") g_cancelNoRetrace++;
+   else if(reason == "bias_none") g_cancelBiasNone++;
+   else if(reason == "cooldown") g_cancelCooldown++;
+   else if(reason == "max_trades") g_cancelMaxTrades++;
+   else if(reason == "sl_blocked") g_cancelSlBlocked++;
+   else if(reason == "hard_block") g_cancelHardBlock++;
+   else if(reason == "no_trade_zone") g_cancelNoTradeZone++;
+   else if(reason == "consec_losses") g_cancelConsecLosses++;
+   else if(reason == "daily_loss") g_cancelDailyLoss++;
+}
+
+//+------------------------------------------------------------------+
+//| Log cancel reason with throttle (60 sec per reason)                 |
+//+------------------------------------------------------------------+
+void LogCancelReasonThrottled(string reason)
+{
+   if(!InpEnableLogging) return;
+   
+   // Rate limit logging to avoid spam - 60 seconds per unique reason
+   static datetime lastLogTimes[];  // Array of last log times per reason
+   static string lastReasons[];     // Array of reasons
+   static int reasonCount = 0;
+   
+   // Find or add reason
+   int idx = -1;
+   for(int i = 0; i < reasonCount; i++)
+   {
+      if(lastReasons[i] == reason)
+      {
+         idx = i;
+         break;
+      }
+   }
+   
+   if(idx < 0)
+   {
+      // Add new reason
+      reasonCount++;
+      ArrayResize(lastLogTimes, reasonCount);
+      ArrayResize(lastReasons, reasonCount);
+      idx = reasonCount - 1;
+      lastReasons[idx] = reason;
+      lastLogTimes[idx] = 0;
+   }
+   
+   // Check throttle
+   if(TimeCurrent() - lastLogTimes[idx] < 60)
+      return;
+   
+   lastLogTimes[idx] = TimeCurrent();
+   
+   // Short log format
+   Print(StringFormat("[%s] Cancel: %s", EnumToString(g_tradeMode), reason));
+}
+
+//+------------------------------------------------------------------+
+//| Log cancel reason (short form, no throttle)                         |
 //+------------------------------------------------------------------+
 void LogCancelReason(string reason)
 {
@@ -2383,29 +2504,6 @@ void LogCancelReason(string reason)
    g_lastCancelReason = reason;
    g_lastCancelTime = TimeCurrent();
    if(!InpEnableLogging) return;
-   
-   // Rate limit logging to avoid spam
-   // Use different throttle times for different reasons
-   static datetime lastLogTime = 0;
-   static string lastReason = "";
-   static datetime lastTimeFilterLog = 0;
-   
-   // Timefilter/rollover: throttle to 15 minutes (900 seconds)
-   if(reason == "timefilter" || reason == "rollover")
-   {
-      if(TimeCurrent() - lastTimeFilterLog < 900)
-         return;
-      lastTimeFilterLog = TimeCurrent();
-   }
-   else
-   {
-      // Other reasons: throttle to 60 seconds per unique reason
-      if(reason == lastReason && TimeCurrent() - lastLogTime < 60)
-         return;
-   }
-   
-   lastLogTime = TimeCurrent();
-   lastReason = reason;
    
    // Short log format: timestamp | mode | reason
    Print(StringFormat("[%s] Cancel: %s", EnumToString(g_tradeMode), reason));
@@ -2557,6 +2655,12 @@ void CheckNewDay()
 //+------------------------------------------------------------------+
 void ResetDailyCounters()
 {
+   // Print daily summary before reset (if we have data)
+   if(g_tradesToday > 0 || g_cancelSpread > 0 || g_cancelNoSweep > 0)
+   {
+      PrintDailySummary();
+   }
+   
    g_tradesToday = 0;
    g_consecLosses = 0;
    g_dailyPnL = 0;
@@ -2568,8 +2672,55 @@ void ResetDailyCounters()
    g_tradeMode = MODE_STRICT;
    g_prevTradeMode = MODE_STRICT;
    
-   Print("Daily counters reset. Start equity: ", g_dailyStartEquity);
+   // Reset cancel counters
+   g_cancelSpread = 0;
+   g_cancelSpreadSpike = 0;
+   g_cancelTimefilter = 0;
+   g_cancelRollover = 0;
+   g_cancelNoSweep = 0;
+   g_cancelNoChoch = 0;
+   g_cancelNoRetrace = 0;
+   g_cancelBiasNone = 0;
+   g_cancelCooldown = 0;
+   g_cancelMaxTrades = 0;
+   g_cancelSlBlocked = 0;
+   g_cancelHardBlock = 0;
+   g_cancelNoTradeZone = 0;
+   g_cancelConsecLosses = 0;
+   g_cancelDailyLoss = 0;
+   g_dailyLossDisabledLogged = false;
+   
+   Print("=== DAILY RESET ===");
+   Print("Start equity: ", g_dailyStartEquity);
    Print("Trade mode reset to STRICT");
+}
+
+//+------------------------------------------------------------------+
+//| Print daily summary of cancel reasons                              |
+//+------------------------------------------------------------------+
+void PrintDailySummary()
+{
+   Print("=== DAILY SUMMARY ===");
+   Print("Trades executed: ", g_tradesToday);
+   Print("SL Hits: ", g_slHitsToday, "/", InpMaxSLHitsPerDay);
+   Print("Daily PnL: ", DoubleToString(g_dailyPnL, 2));
+   Print("--- Cancel Reasons ---");
+   if(g_cancelSpread > 0) Print("  spread: ", g_cancelSpread);
+   if(g_cancelSpreadSpike > 0) Print("  spread_spike: ", g_cancelSpreadSpike);
+   if(g_cancelTimefilter > 0) Print("  timefilter: ", g_cancelTimefilter);
+   if(g_cancelRollover > 0) Print("  rollover: ", g_cancelRollover);
+   if(g_cancelNoTradeZone > 0) Print("  no_trade_zone: ", g_cancelNoTradeZone);
+   if(g_cancelHardBlock > 0) Print("  hard_block: ", g_cancelHardBlock);
+   if(g_cancelNoSweep > 0) Print("  no_sweep: ", g_cancelNoSweep);
+   if(g_cancelNoChoch > 0) Print("  no_choch: ", g_cancelNoChoch);
+   if(g_cancelNoRetrace > 0) Print("  no_retrace: ", g_cancelNoRetrace);
+   if(g_cancelBiasNone > 0) Print("  bias_none: ", g_cancelBiasNone);
+   if(g_cancelCooldown > 0) Print("  cooldown: ", g_cancelCooldown);
+   if(g_cancelMaxTrades > 0) Print("  max_trades: ", g_cancelMaxTrades);
+   if(g_cancelSlBlocked > 0) Print("  sl_blocked: ", g_cancelSlBlocked);
+   if(g_cancelConsecLosses > 0) Print("  consec_losses: ", g_cancelConsecLosses);
+   if(g_cancelDailyLoss > 0) Print("  daily_loss: ", g_cancelDailyLoss);
+   Print("====================");
 }
 
 //+------------------------------------------------------------------+
@@ -2815,7 +2966,7 @@ void UpdatePanel()
    string panelName = g_objPrefix + "Panel";
    
    // Delete old labels
-   for(int i = 0; i < 16; i++)
+   for(int i = 0; i < 20; i++)
    {
       ObjectDelete(0, panelName + IntegerToString(i));
    }
@@ -2823,7 +2974,7 @@ void UpdatePanel()
    int x = 10, y = 30, lineHeight = 16;
    color textColor = clrWhite;
    
-   // Panel background - increased height for new fields
+   // Panel background - increased height for cancel counters
    string bgName = panelName + "BG";
    if(ObjectFind(0, bgName) < 0)
    {
@@ -2831,14 +2982,14 @@ void UpdatePanel()
    }
    ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, x - 5);
    ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, y - 5);
-   ObjectSetInteger(0, bgName, OBJPROP_XSIZE, 290);
-   ObjectSetInteger(0, bgName, OBJPROP_YSIZE, lineHeight * 15);
+   ObjectSetInteger(0, bgName, OBJPROP_XSIZE, 320);
+   ObjectSetInteger(0, bgName, OBJPROP_YSIZE, lineHeight * 17);
    ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR, clrDarkSlateGray);
    ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.7", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v1.9", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
@@ -2912,6 +3063,15 @@ void UpdatePanel()
    TimeToStruct(TimeCurrent(), dt);
    string switchInfo = StringFormat("R@%d R2@%d Block@%04d (Now:%d)", InpRelaxSwitchHour, InpRelax2Hour, InpHardBlockAfterHHMM, dt.hour);
    CreateLabel(panelName + "13", x, y + lineHeight*13, switchInfo, clrGray);
+   
+   // Cancel counters (compact format)
+   string cancelStats1 = StringFormat("Cnl: sprd=%d spk=%d tf=%d roll=%d", 
+                                      g_cancelSpread, g_cancelSpreadSpike, g_cancelTimefilter, g_cancelRollover);
+   CreateLabel(panelName + "14", x, y + lineHeight*14, cancelStats1, clrGray);
+   
+   string cancelStats2 = StringFormat("     swp=%d choch=%d retr=%d bias=%d", 
+                                      g_cancelNoSweep, g_cancelNoChoch, g_cancelNoRetrace, g_cancelBiasNone);
+   CreateLabel(panelName + "15", x, y + lineHeight*15, cancelStats2, clrGray);
 }
 
 //+------------------------------------------------------------------+
