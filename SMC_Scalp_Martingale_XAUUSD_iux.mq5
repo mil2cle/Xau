@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v3.1                         |
+//|                    SMC Scalping Bot v3.2                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v3.1"
+#property copyright "SMC Scalping Bot v3.2"
 #property link      ""
-#property version   "3.10"
+#property version   "3.20"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -240,6 +240,7 @@ input double   InpRecoveryFactor    = 1.05;           // Recovery factor (1.05 =
 input double   InpRecoveryBufferMoney = 0.0;          // Extra buffer money to recover ($)
 input int      InpMaxTPPoints       = 2000;           // Max TP distance (points)
 input int      InpMinTPPoints       = 100;            // Min TP distance (points)
+input bool     InpDisablePartialOnRecovery = true;    // Disable partial close/BE/trailing during recovery
 
 input group "=== Same Setup Only (Martingale) ==="
 input bool     InpMartSameSetupOnly = true;           // Only continue mart if same setup
@@ -323,6 +324,20 @@ string         g_recoveryLossKey = "";       // GlobalVariable key for persisten
 string         g_lastSetupSignature = "";   // Signature of last losing trade setup
 datetime       g_lastLossTime = 0;           // Time of last loss (for bars since loss)
 int            g_lastLossBarIndex = 0;       // Bar index of last loss
+
+// Entry tracking (for comment/lot consistency)
+int            g_entryMartLevel = 0;         // MartLevel used when opening current position
+
+// Position-based profit tracking (for partial close support)
+struct PositionProfitData
+{
+   ulong    positionId;
+   double   volumeIn;         // Total volume opened
+   double   volumeOut;        // Total volume closed
+   double   profitAccum;      // Accumulated profit (including partial closes)
+   bool     isActive;
+};
+PositionProfitData g_positionData;            // Current position data
 
 // Logging
 int            g_tradesFileHandle = INVALID_HANDLE;
@@ -594,7 +609,7 @@ int OnInit()
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
    Print("Martingale: Mode=", EnumToString(InpMartingaleMode), " | Mult=", InpMartMultiplier, " | MaxLvl=", InpMartMaxLevel, " | StrictOnly=", InpMartingaleStrictOnly);
    Print("Recovery TP: Enabled=", InpUseRecoveryTP, " | Factor=", InpRecoveryFactor, " | Buffer=", InpRecoveryBufferMoney, 
-         " | MinTP=", InpMinTPPoints, " | MaxTP=", InpMaxTPPoints);
+         " | MinTP=", InpMinTPPoints, " | MaxTP=", InpMaxTPPoints, " | DisablePartial=", InpDisablePartialOnRecovery);
    Print("Same Setup: Enabled=", InpMartSameSetupOnly, " | MaxBars=", InpMartMaxBarsSinceLoss, " | ResetIfChanged=", InpMartResetIfSetupChanged);
    
    return(INIT_SUCCEEDED);
@@ -1856,26 +1871,30 @@ void PlaceOrder()
    // Calculate SL/TP
    CalculateSLTP();
    
-   // Get current lot based on martingale
-   g_currentLot = CalculateLot();
-   
-   double price, sl, tp;
-   ENUM_ORDER_TYPE orderType;
-   
-   // === SAME SETUP ONLY CHECK ===
+   // === SAME SETUP ONLY CHECK (BEFORE lot calculation) ===
    // Check if martingale should continue based on setup signature
    if(g_martLevel > 0 && InpMartSameSetupOnly)
    {
       if(!CheckSameSetup())
       {
-         PrintFormat("SAME_SETUP: Setup changed or timeout - martLevel was reset");
-         // martLevel was reset in CheckSameSetup(), continue with L0
+         PrintFormat("SAME_SETUP: Setup changed or timeout - martLevel was reset to 0");
+         // martLevel was reset in CheckSameSetup(), recalculate lot
       }
    }
    
    // Store current setup signature (for next loss comparison)
    g_lastSetupSignature = GetSetupSignature();
-   PrintFormat("SETUP_SIG: Stored signature=%s for martLevel=%d", g_lastSetupSignature, g_martLevel);
+   
+   // === CAPTURE martLevelUsed BEFORE lot calculation ===
+   // This ensures comment and lot use the SAME level
+   int martLevelUsed = g_martLevel;
+   
+   // Get current lot based on martingale (uses g_martLevel)
+   g_currentLot = CalculateLot();
+   double finalLotUsed = g_currentLot;
+   
+   PrintFormat("ENTRY_PREP: martLevelUsed=%d finalLotUsed=%.2f signature=%s recLoss=%.2f",
+               martLevelUsed, finalLotUsed, g_lastSetupSignature, g_recoveryLoss);
    
    if(g_sweepType == SWEEP_BULLISH)
    {
@@ -1912,26 +1931,32 @@ void PlaceOrder()
                   tp, originalTP, g_recoveryLoss);
    }
    
-   // Comment format: SMC_LONG_L0_MA_REC{tpPoints} (MA=AllModes, REC=Recovery TP points)
+   // Comment format: SMC_LONG_L0_MA_R{tpPoints} (MA=AllModes, R=Recovery TP points)
+   // MUST use martLevelUsed (captured before lot calc) to ensure comment matches lot
    string strictOnlyStr = InpMartingaleStrictOnly ? "S" : "A";
+   string dirStr = (g_sweepType == SWEEP_BULLISH) ? "LONG" : "SHORT";
    string comment;
    if(recoveryTP > 0)
    {
       comment = StringFormat("SMC_%s_L%d_M%s_R%d", 
-                             g_sweepType == SWEEP_BULLISH ? "LONG" : "SHORT",
-                             g_martLevel,
+                             dirStr,
+                             martLevelUsed,  // Use captured level, not g_martLevel
                              strictOnlyStr,
                              recoveryTPPoints);
    }
    else
    {
       comment = StringFormat("SMC_%s_L%d_M%s", 
-                             g_sweepType == SWEEP_BULLISH ? "LONG" : "SHORT",
-                             g_martLevel,
+                             dirStr,
+                             martLevelUsed,  // Use captured level, not g_martLevel
                              strictOnlyStr);
    }
    
-   if(trade.PositionOpen(tradeSym, orderType, g_currentLot, price, sl, tp, comment))
+   // === FINAL ENTRY LOG (before order) ===
+   PrintFormat("ENTRY: levelUsed=%d lot=%.2f recLoss=%.2f tpPts=%d signature=%s comment=%s",
+               martLevelUsed, finalLotUsed, g_recoveryLoss, recoveryTPPoints, g_lastSetupSignature, comment);
+   
+   if(trade.PositionOpen(tradeSym, orderType, finalLotUsed, price, sl, tp, comment))
    {
       g_currentTicket = trade.ResultOrder();
       g_entryPrice = price;
@@ -1940,10 +1965,19 @@ void PlaceOrder()
       g_lastTradeTime = TimeCurrent();  // Update last trade time for cooldown
       g_state = STATE_MANAGE_TRADE;
       
+      // Store entry level for this position (for close verification)
+      g_entryMartLevel = martLevelUsed;
+      
+      // Initialize position tracking for partial close support
+      g_positionData.volumeIn = finalLotUsed;
+      g_positionData.volumeOut = 0;
+      g_positionData.profitAccum = 0;
+      g_positionData.isActive = true;
+      // positionId will be set when first DEAL_ENTRY_OUT arrives
+      
       // Detailed martingale entry log
-      PrintFormat("MART_ENTRY: dir=%s level=%d base=%.2f mult=%.2f final=%.2f comment=%s",
-                  g_sweepType == SWEEP_BULLISH ? "LONG" : "SHORT",
-                  g_martLevel, InpBaseLot, MathPow(InpMartMultiplier, g_martLevel), g_currentLot, comment);
+      PrintFormat("MART_ENTRY: dir=%s levelUsed=%d base=%.2f mult=%.2f final=%.2f comment=%s",
+                  dirStr, martLevelUsed, InpBaseLot, MathPow(InpMartMultiplier, martLevelUsed), finalLotUsed, comment);
       
       Print("Order placed: ", EnumToString(orderType), " Lot: ", g_currentLot, 
             " Entry: ", price, " SL: ", sl, " TP1: ", tp, " Mode: ", EnumToString(g_tradeMode));
@@ -2135,7 +2169,23 @@ void ManageTrade()
    double profitPoints = MathAbs(currentPrice - posOpenPrice);
    
    // Check for partial close at TP1 or 1R
-   if(!g_partialClosed)
+   // === SKIP PARTIAL CLOSE DURING RECOVERY ===
+   bool inRecoveryMode = (InpUseRecoveryTP && (g_martLevel > 0 || g_recoveryLoss > 0));
+   
+   if(InpDisablePartialOnRecovery && inRecoveryMode)
+   {
+      // Skip partial close, BE move, and trailing during recovery
+      // Only SL and Recovery TP will close the position
+      // Log once per position
+      static ulong lastLoggedPosId = 0;
+      if(lastLoggedPosId != g_positionData.positionId)
+      {
+         PrintFormat("RECOVERY_GUARD: Partial close/BE disabled - martLevel=%d recLoss=%.2f",
+                     g_martLevel, g_recoveryLoss);
+         lastLoggedPosId = g_positionData.positionId;
+      }
+   }
+   else if(!g_partialClosed)
    {
       bool atTP1 = false;
       bool at1R = profitPoints >= riskPoints;
@@ -3258,32 +3308,83 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
       return;
    }
    
-   // Get profit including commission and swap
+   // === POSITION-BASED TRACKING (for partial close support) ===
+   ulong positionId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
    double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
    double dealCommission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
    double dealSwap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
-   double profitNet = dealProfit + dealCommission + dealSwap;
-   
-   // Get deal volume for logging
+   double dealProfitNet = dealProfit + dealCommission + dealSwap;
    double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
    
-   PrintFormat("MART_DEBUG: profit=%.2f comm=%.2f swap=%.2f net=%.2f vol=%.2f",
-               dealProfit, dealCommission, dealSwap, profitNet, dealVolume);
+   PrintFormat("MART_DEBUG: posId=%I64u profit=%.2f comm=%.2f swap=%.2f net=%.2f vol=%.2f",
+               positionId, dealProfit, dealCommission, dealSwap, dealProfitNet, dealVolume);
+   
+   // Accumulate profit for this position
+   if(g_positionData.positionId == positionId && g_positionData.isActive)
+   {
+      // Same position - accumulate
+      g_positionData.volumeOut += dealVolume;
+      g_positionData.profitAccum += dealProfitNet;
+      PrintFormat("MART_DEBUG: Accumulated - volOut=%.2f profitAccum=%.2f",
+                  g_positionData.volumeOut, g_positionData.profitAccum);
+   }
+   else
+   {
+      // New position or first deal - initialize
+      g_positionData.positionId = positionId;
+      g_positionData.volumeOut = dealVolume;
+      g_positionData.profitAccum = dealProfitNet;
+      g_positionData.isActive = true;
+      // volumeIn should be set when position opens, but use dealVolume as fallback
+      if(g_positionData.volumeIn <= 0)
+         g_positionData.volumeIn = g_currentLot;
+      PrintFormat("MART_DEBUG: New position tracking - posId=%I64u volIn=%.2f volOut=%.2f profitAccum=%.2f",
+                  positionId, g_positionData.volumeIn, g_positionData.volumeOut, g_positionData.profitAccum);
+   }
+   
+   // Check if position is fully closed
+   // Allow small tolerance for floating point comparison
+   bool positionFullyClosed = (g_positionData.volumeOut >= g_positionData.volumeIn - 0.001);
+   
+   if(!positionFullyClosed)
+   {
+      // Partial close - don't update martingale yet
+      PrintFormat("MART_DEBUG: PARTIAL CLOSE - volOut=%.2f < volIn=%.2f - waiting for full close",
+                  g_positionData.volumeOut, g_positionData.volumeIn);
+      return;
+   }
+   
+   // === POSITION FULLY CLOSED - NOW UPDATE MARTINGALE ===
+   PrintFormat("MART_DEBUG: POSITION FULLY CLOSED - posId=%I64u totalProfit=%.2f",
+               positionId, g_positionData.profitAccum);
+   
+   double profitNet = g_positionData.profitAccum;  // Use accumulated profit
+   
+   // Reset position tracking
+   g_positionData.isActive = false;
+   g_positionData.volumeIn = 0;
+   g_positionData.volumeOut = 0;
+   g_positionData.profitAccum = 0;
    
    // Store previous level for logging
    int prevMartLevel = g_martLevel;
-   
-   // Store previous recoveryLoss for logging
    double prevRecoveryLoss = g_recoveryLoss;
    
    // Update martingale level and recovery loss
    if(profitNet > 0)
    {
-      // Win: check if we recovered enough
-      if(profitNet >= g_recoveryLoss)
+      // Win: reduce recoveryLoss by profit amount
+      double newRecoveryLoss = MathMax(0, g_recoveryLoss - profitNet);
+      
+      PrintFormat("MART_DEBUG: WIN - profit=%.2f recoveryLoss=%.2f -> %.2f",
+                  profitNet, g_recoveryLoss, newRecoveryLoss);
+      
+      g_recoveryLoss = newRecoveryLoss;
+      
+      // Only reset martLevel when recoveryLoss reaches 0
+      if(g_recoveryLoss <= 0)
       {
-         // Fully recovered: reset everything
-         PrintFormat("MART_DEBUG: WIN - profit=%.2f >= recoveryLoss=%.2f - FULL RECOVERY", profitNet, g_recoveryLoss);
+         PrintFormat("MART_DEBUG: FULL RECOVERY - martLevel %d -> 0", g_martLevel);
          g_martLevel = 0;
          g_recoveryLoss = 0;
          g_consecLosses = 0;
@@ -3292,11 +3393,8 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
       }
       else
       {
-         // Partial recovery: reduce recoveryLoss but keep martLevel
-         g_recoveryLoss -= profitNet;
-         PrintFormat("MART_DEBUG: WIN - profit=%.2f < recoveryLoss=%.2f - PARTIAL RECOVERY, remaining=%.2f", 
-                     profitNet, prevRecoveryLoss, g_recoveryLoss);
-         // Keep martLevel for next trade to continue recovery
+         PrintFormat("MART_DEBUG: PARTIAL RECOVERY - martLevel stays at %d, remaining recLoss=%.2f",
+                     g_martLevel, g_recoveryLoss);
       }
    }
    else if(profitNet < 0)
@@ -3326,6 +3424,10 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
    {
       Print("MART_DEBUG: BREAKEVEN - level unchanged");
    }
+   
+   // === FINAL CLOSE LOG ===
+   PrintFormat("CLOSE: posId=%I64u net=%.2f martLevel=%d->%d recLoss=%.2f->%.2f",
+               positionId, profitNet, prevMartLevel, g_martLevel, prevRecoveryLoss, g_recoveryLoss);
    
    // === SAVE TO GLOBALVARIABLE ===
    // Persist martLevel immediately after any change
