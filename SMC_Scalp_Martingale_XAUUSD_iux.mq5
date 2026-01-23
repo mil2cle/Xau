@@ -654,7 +654,7 @@ int OnInit()
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
    Print("Martingale: Mode=", EnumToString(InpMartingaleMode), " | Mult=", InpMartMultiplier, " | MaxLvl=", InpMartMaxLevel, " | StrictOnly=", InpMartingaleStrictOnly);
    Print("Recovery TP: Enabled=", InpUseRecoveryTP, " | Factor=", InpRecoveryFactor, " | Buffer=", InpRecoveryBufferMoney, 
-         " | MinTP=", InpMinTPPoints, " | MaxTP=", InpMaxTPPoints, " | DisablePartial=", InpDisablePartialOnRecovery);
+         " | MinTP1=", InpMinTP1Points, " | MinTP2=", InpMinTP2Points, " | MaxTP=", InpMaxTPPoints, " | DisablePartial=", InpDisablePartialOnRecovery);
    Print("Same Setup: Enabled=", InpMartSameSetupOnly, " | MaxBars=", InpMartMaxBarsSinceLoss, " | ResetIfChanged=", InpMartResetIfSetupChanged);
    
    return(INIT_SUCCEEDED);
@@ -3108,8 +3108,8 @@ double CalculateRecoveryTP(double entryPrice, double lot, bool isBuy)
    // Calculate required TP distance in points
    int tpPoints = (int)MathCeil(recoveryTargetMoney / moneyPerPoint);
    
-   // Apply min/max constraints
-   tpPoints = MathMax(InpMinTPPoints, MathMin(InpMaxTPPoints, tpPoints));
+   // Apply min/max constraints (use InpMinTP2Points as minimum for recovery TP)
+   tpPoints = MathMax(InpMinTP2Points, MathMin(InpMaxTPPoints, tpPoints));
    
    // Calculate TP price
    double tpPrice;
