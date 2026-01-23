@@ -1,12 +1,13 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v3.4                         |
+//|                    SMC Scalping Bot v3.4.1                       |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + Strategy Change B: TP2 + Partial Close at TP1|
+//|                    + Fix: SL hits only count actual losses       |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v3.4"
+#property copyright "SMC Scalping Bot v3.4.1"
 #property link      ""
-#property version   "3.40"
+#property version   "3.41"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -146,7 +147,8 @@ input int      InpStage2ConfirmBars  = 3;              // Stage2 close-confirm w
 
 input group "=== SL/TP Parameters ==="
 input int      InpSLBufferPoints    = 40;             // SL buffer min (points)
-input int      InpMinTPPoints       = 100;            // Min TP distance (points) - for TP2 fallback
+input int      InpMinTP1Points      = 120;            // Min TP1 distance (points) - skip partial if closer
+input int      InpMinTP2Points      = 250;            // Min TP2 distance (points) - fallback if closer
 input int      InpMaxTPPoints       = 2000;           // Max TP distance (points) - clamp TP2
 input bool     InpUseBrokerTP       = true;           // Use broker TP (false = no TP, manage manually)
 
@@ -154,10 +156,11 @@ input group "=== TP1 Partial Close ==="
 input bool     InpUseTP1PartialClose = true;          // Enable partial close at TP1
 input double   InpTP1CloseFraction   = 0.50;          // Fraction to close at TP1 (0.50 = 50%)
 input bool     InpMoveSLToBEOnTP1    = true;          // Move SL to BE after TP1 partial close
-input int      InpBEOffsetPoints     = 5;             // BE offset points (+ for profit buffer)
+input int      InpBEOffsetPoints     = 25;            // BE offset points (+ for profit buffer)
+input double   InpMoveSLToLockR      = 0.0;           // Lock R multiple (0=use BE, >0=entry +/- LockR*riskPts)
 input int      InpTP1TriggerBufferPoints = 1;         // TP1 trigger buffer (allow slightly before/after)
 input double   InpMinPartialLots     = 0.01;          // Min partial close lots
-input double   InpPartialClosePercent = 50.0;         // Partial close % at TP1/1R (legacy, use InpTP1CloseFraction)
+input double   InpPartialClosePercent = 50.0;         // Partial close % at TP1/1R (legacy)
 
 input group "=== Risk Guardrails ==="
 input int      InpCooldownBars      = 3;              // Cooldown bars after close
@@ -445,11 +448,28 @@ ulong          g_tp1PositionId = 0;            // Position ID for TP1 tracking
 // TP1 Diagnostic Counters
 int            g_tp1PartialTriggeredCount = 0;  // Daily count
 int            g_tp1PartialFailedCount = 0;     // Daily count (with reason)
+int            g_tp1PartialSkippedCount = 0;    // Daily: skipped because TP1 too close
 int            g_beMovedCount = 0;              // Daily count
 int            g_totalTP1PartialTriggered = 0;  // All time
 int            g_totalTP1PartialFailed = 0;     // All time
+int            g_totalTP1PartialSkipped = 0;    // All time
 int            g_totalBEMoved = 0;              // All time
 string         g_lastTP1FailReason = "";        // Last failure reason
+
+// Exit Classification Counters (Daily)
+int            g_slLossHitsCount = 0;           // SL hits with actual loss (profit < 0)
+int            g_beStopCount = 0;               // SL hits but profit >= 0 (BE stop)
+int            g_tpHitsCount = 0;               // TP hits
+int            g_manualCloseCount = 0;          // Manual/other close
+
+// Exit Classification Counters (All Time)
+int            g_totalSlLossHits = 0;
+int            g_totalBeStops = 0;
+int            g_totalTpHits = 0;
+int            g_totalManualClose = 0;
+
+// Track if TP1 partial is disabled for current position (TP1 too close)
+bool           g_tp1PartialDisabled = false;    // Set in PlaceOrder if tp1Pts < InpMinTP1Points
 
 // Note: RELAX mode parameters are now controlled via input parameters
 // InpRelaxSweepBreakPoints, InpRelaxRollingLiqBars, InpRelax2SweepBreakPoints, etc.
@@ -613,8 +633,9 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v3.4 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v3.4.1 initialized on ", tradeSym);
    Print("Strategy Change B: TP at TP2, Partial close at TP1, BE move after TP1");
+   Print("Fix: SL hits only count actual losses (BE stops excluded from guardrail)");
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -692,7 +713,7 @@ void OnDeinit(const int reason)
       PrintFormat("MART_PERSIST: Saved recoveryLoss=%.2f to GlobalVariable key=%s", g_recoveryLoss, g_recoveryLossKey);
    }
    
-   Print("SMC Scalping Bot v3.4 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v3.4.1 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -1994,9 +2015,20 @@ void PlaceOrder()
    double tp2Pts = MathAbs(g_tp2Price - price) / _Point;
    double spreadPts = GetSpreadPoints();
    string setupType = (g_sweepType == SWEEP_BULLISH) ? "LONG" : "SHORT";
+   bool isRecovery = (g_recoveryLoss > 0 || g_martLevel > 0);
    
-   PrintFormat("[ENTRY] %s entry=%.5f sl=%.5f tp1=%.5f tp2=%.5f slPts=%.0f tp1Pts=%.0f tp2Pts=%.0f spreadPts=%.1f mode=%s",
-               setupType, price, sl, g_tp1Price, g_tp2Price, slPts, tp1Pts, tp2Pts, spreadPts, EnumToString(g_tradeMode));
+   // Check if TP1 is too close - disable partial close for this position
+   g_tp1PartialDisabled = (tp1Pts < InpMinTP1Points);
+   if(g_tp1PartialDisabled)
+   {
+      PrintFormat("[ENTRY] TP1 too close (%.0f < %d pts) - partial close DISABLED for this position",
+                  tp1Pts, InpMinTP1Points);
+      g_tp1PartialSkippedCount++;
+   }
+   
+   PrintFormat("[ENTRY] %s entry=%.5f sl=%.5f tp1=%.5f tp2=%.5f slPts=%.0f tp1Pts=%.0f tp2Pts=%.0f spreadPts=%.1f mode=%s isRecovery=%s tp1Disabled=%s",
+               setupType, price, sl, g_tp1Price, g_tp2Price, slPts, tp1Pts, tp2Pts, spreadPts, 
+               EnumToString(g_tradeMode), isRecovery ? "Y" : "N", g_tp1PartialDisabled ? "Y" : "N");
    PrintFormat("ENTRY: levelUsed=%d lot=%.2f recLoss=%.2f tpPts=%d signature=%s comment=%s",
                martLevelUsed, finalLotUsed, g_recoveryLoss, recoveryTPPoints, g_lastSetupSignature, comment);
    
@@ -2071,15 +2103,14 @@ void CalculateSLTP()
       g_tp2Price = GetFurtherLiquidity(true);
       
       // === TP2 FALLBACK ===
-      // If TP2 not found or too close to TP1, use fallback
+      // If TP2 not found or too close, use InpMinTP2Points as fallback
       double tp2Distance = (g_tp2Price - currentPrice) / _Point;
       double tp1Distance = (g_tp1Price - currentPrice) / _Point;
       
-      if(g_tp2Price <= g_tp1Price || tp2Distance < InpMinTPPoints)
+      if(g_tp2Price <= g_tp1Price || tp2Distance < InpMinTP2Points)
       {
-         // Fallback: entry + max(InpMinTPPoints, 200) points
-         double fallbackPoints = MathMax(InpMinTPPoints, 200);
-         g_tp2Price = currentPrice + fallbackPoints * _Point;
+         // Fallback: entry + InpMinTP2Points
+         g_tp2Price = currentPrice + InpMinTP2Points * _Point;
       }
       
       // Clamp TP2 to InpMaxTPPoints
@@ -2100,15 +2131,14 @@ void CalculateSLTP()
       g_tp2Price = GetFurtherLiquidity(false);
       
       // === TP2 FALLBACK ===
-      // If TP2 not found or too close to TP1, use fallback
+      // If TP2 not found or too close, use InpMinTP2Points as fallback
       double tp2Distance = (currentPrice - g_tp2Price) / _Point;
       double tp1Distance = (currentPrice - g_tp1Price) / _Point;
       
-      if(g_tp2Price >= g_tp1Price || tp2Distance < InpMinTPPoints)
+      if(g_tp2Price >= g_tp1Price || tp2Distance < InpMinTP2Points)
       {
-         // Fallback: entry - max(InpMinTPPoints, 200) points
-         double fallbackPoints = MathMax(InpMinTPPoints, 200);
-         g_tp2Price = currentPrice - fallbackPoints * _Point;
+         // Fallback: entry - InpMinTP2Points
+         g_tp2Price = currentPrice - InpMinTP2Points * _Point;
       }
       
       // Clamp TP2 to InpMaxTPPoints
@@ -2248,6 +2278,30 @@ double NormalizeVolume(double volume)
 }
 
 //+------------------------------------------------------------------+
+//| Normalize volume to step (floor only, no min clamp)                 |
+//| For partial close: returns 0 if result < minVol (caller decides)    |
+//+------------------------------------------------------------------+
+double NormalizeVolumeToStep(double volume)
+{
+   double minVol = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MIN);
+   double maxVol = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MAX);
+   double stepVol = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_STEP);
+   
+   // Floor to volume step (never round up to avoid closing more than intended)
+   volume = MathFloor(volume / stepVol) * stepVol;
+   
+   // If result is less than minVol, return 0 (caller should skip partial close)
+   if(volume < minVol)
+      return 0;
+   
+   // Clamp to max only
+   if(volume > maxVol)
+      volume = maxVol;
+   
+   return NormalizeDouble(volume, 2);
+}
+
+//+------------------------------------------------------------------+
 //| Check if price modification respects broker constraints            |
 //+------------------------------------------------------------------+
 bool CanModifyStopLevel(double price, double newSL, long posType)
@@ -2328,7 +2382,8 @@ void ManageTrade()
    
    // === STRATEGY CHANGE B: TP1 PARTIAL CLOSE ===
    // Check if TP1 action should be triggered
-   if(InpUseTP1PartialClose && !g_tp1Done)
+   // Skip if TP1 partial was disabled at entry (TP1 too close)
+   if(InpUseTP1PartialClose && !g_tp1Done && !g_tp1PartialDisabled)
    {
       // Check if this is the same position we're tracking
       if(g_tp1PositionId != posTicket)
@@ -2349,15 +2404,23 @@ void ManageTrade()
       
       if(atTP1)
       {
-         // Calculate partial close volume
-         double closeVolume = NormalizeVolume(posVolume * InpTP1CloseFraction);
+         // Calculate partial close volume using NormalizeVolumeToStep
+         double closeVolume = NormalizeVolumeToStep(posVolume * InpTP1CloseFraction);
+         double minVol = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MIN);
          double minStep = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_STEP);
          
          // Check if volume is valid
-         bool volumeValid = (closeVolume >= InpMinPartialLots && closeVolume >= minStep);
+         bool volumeValid = (closeVolume >= InpMinPartialLots && closeVolume >= minVol);
          bool canPartialClose = volumeValid && (closeVolume < posVolume);  // Must leave some volume
          
-         if(canPartialClose)
+         // Special case: if posVolume == minVol, skip partial (can't split further)
+         if(posVolume <= minVol)
+         {
+            g_tp1Done = true;
+            PrintFormat("[TP1] Partial close SKIPPED: posVolume=%.2f == minVol=%.2f (cannot split)",
+                        posVolume, minVol);
+         }
+         else if(canPartialClose)
          {
             // Execute partial close
             if(trade.PositionClosePartial(tradeSym, closeVolume))
@@ -2366,17 +2429,35 @@ void ManageTrade()
                g_tp1PartialTriggeredCount++;
                g_partialClosed = true;  // Legacy flag
                
-               PrintFormat("[TP1] Partial close SUCCESS: closed=%.2f remaining=%.2f", 
-                           closeVolume, posVolume - closeVolume);
+               double remainingVol = posVolume - closeVolume;
+               PrintFormat("[TP1] price=%.5f closeVol=%.2f remainingVol=%.2f reason=tp1_partial", 
+                           currentPrice, closeVolume, remainingVol);
                
-               // === MOVE SL TO BE ===
+               // === MOVE SL ===
                if(InpMoveSLToBEOnTP1)
                {
                   double newSL;
-                  if(posType == POSITION_TYPE_BUY)
-                     newSL = posOpenPrice + InpBEOffsetPoints * _Point;
+                  double spreadPts = GetSpreadPoints();
+                  
+                  // Calculate new SL based on LockR or BE offset
+                  if(InpMoveSLToLockR > 0)
+                  {
+                     // LockR mode: entry +/- (LockR * riskPoints)
+                     double lockOffset = InpMoveSLToLockR * riskPoints;
+                     if(posType == POSITION_TYPE_BUY)
+                        newSL = posOpenPrice + lockOffset;
+                     else
+                        newSL = posOpenPrice - lockOffset;
+                  }
                   else
-                     newSL = posOpenPrice - InpBEOffsetPoints * _Point;
+                  {
+                     // BE mode: entry +/- (spreadPoints + BEOffsetPoints)
+                     double beOffset = (spreadPts + InpBEOffsetPoints) * _Point;
+                     if(posType == POSITION_TYPE_BUY)
+                        newSL = posOpenPrice + beOffset;
+                     else
+                        newSL = posOpenPrice - beOffset;
+                  }
                   
                   newSL = NormalizeDouble(newSL, _Digits);
                   
@@ -2387,17 +2468,21 @@ void ManageTrade()
                      if(trade.PositionModify(tradeSym, newSL, posTP))
                      {
                         g_beMovedCount++;
-                        PrintFormat("[TP1] SL moved to BE: newSL=%.5f (BE+%d pts) tp2_remains=%.5f",
-                                    newSL, InpBEOffsetPoints, posTP);
+                        if(InpMoveSLToLockR > 0)
+                           PrintFormat("[TP1] SL moved to LockR: newSL=%.5f (%.2fR) newTP=%.5f",
+                                       newSL, InpMoveSLToLockR, posTP);
+                        else
+                           PrintFormat("[TP1] SL moved to BE: newSL=%.5f (spread+%d pts) newTP=%.5f",
+                                       newSL, InpBEOffsetPoints, posTP);
                      }
                      else
                      {
-                        PrintFormat("[TP1] BE move FAILED: error=%d", GetLastError());
+                        PrintFormat("[TP1] SL move FAILED: error=%d", GetLastError());
                      }
                   }
                   else
                   {
-                     PrintFormat("[TP1] BE move SKIPPED: stops_level constraint");
+                     PrintFormat("[TP1] SL move SKIPPED: stops_level constraint");
                   }
                }
             }
@@ -2414,17 +2499,31 @@ void ManageTrade()
             g_tp1Done = true;
             g_tp1PartialFailedCount++;
             g_lastTP1FailReason = "invalid_volume";
-            PrintFormat("[TP1] Partial close SKIPPED: closeVol=%.2f < minPartial=%.2f or minStep=%.2f",
-                        closeVolume, InpMinPartialLots, minStep);
+            PrintFormat("[TP1] Partial close SKIPPED: closeVol=%.2f < minPartial=%.2f or minVol=%.2f",
+                        closeVolume, InpMinPartialLots, minVol);
             
             // Still move SL to BE if enabled
             if(InpMoveSLToBEOnTP1)
             {
                double newSL;
-               if(posType == POSITION_TYPE_BUY)
-                  newSL = posOpenPrice + InpBEOffsetPoints * _Point;
+               double spreadPts = GetSpreadPoints();
+               
+               if(InpMoveSLToLockR > 0)
+               {
+                  double lockOffset = InpMoveSLToLockR * riskPoints;
+                  if(posType == POSITION_TYPE_BUY)
+                     newSL = posOpenPrice + lockOffset;
+                  else
+                     newSL = posOpenPrice - lockOffset;
+               }
                else
-                  newSL = posOpenPrice - InpBEOffsetPoints * _Point;
+               {
+                  double beOffset = (spreadPts + InpBEOffsetPoints) * _Point;
+                  if(posType == POSITION_TYPE_BUY)
+                     newSL = posOpenPrice + beOffset;
+                  else
+                     newSL = posOpenPrice - beOffset;
+               }
                
                newSL = NormalizeDouble(newSL, _Digits);
                
@@ -2433,7 +2532,7 @@ void ManageTrade()
                   if(trade.PositionModify(tradeSym, newSL, posTP))
                   {
                      g_beMovedCount++;
-                     PrintFormat("[TP1] SL moved to BE (no partial): newSL=%.5f", newSL);
+                     PrintFormat("[TP1] SL moved (no partial): newSL=%.5f", newSL);
                   }
                }
             }
@@ -3503,24 +3602,45 @@ void CheckDealForSLHit(ulong dealTicket)
    if(IsPositionIdCounted(positionId))
       return;
    
-   // Count this SL hit
-   AddCountedPositionId(positionId);
-   g_slHitsToday++;
-   
    double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+   double dealCommission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+   double dealSwap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
    double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+   double profitNet = dealProfit + dealCommission + dealSwap;
    
-   Print("=== SL HIT COUNTED ===");
-   Print("Deal: ", dealTicket, " | Position: ", positionId);
-   Print("Volume: ", dealVolume, " | Profit: ", dealProfit);
-   Print("SL Hits Today: ", g_slHitsToday, "/", InpMaxSLHitsPerDay);
+   // === CRITICAL FIX: Only count as SL hit if actual loss ===
+   // BE stop (profit >= 0 or >= -commission_epsilon) should NOT count toward daily limit
+   double commissionEpsilon = 0.50;  // Allow small negative from commission
+   bool isActualLoss = (profitNet < -commissionEpsilon);
    
-   // Check if max SL hits reached
-   if(g_slHitsToday >= InpMaxSLHitsPerDay && InpStopTradingOnSLHits)
+   // Always mark position as counted to prevent double counting
+   AddCountedPositionId(positionId);
+   
+   if(isActualLoss)
    {
-      g_blockedToday = true;
-      Print("=== DAILY STOP TRIGGERED ===");
-      Print("Max SL hits (", InpMaxSLHitsPerDay, ") reached. Trading blocked for today.");
+      // Real SL loss - count toward daily limit
+      g_slHitsToday++;
+      
+      Print("=== SL LOSS COUNTED ===");
+      Print("Deal: ", dealTicket, " | Position: ", positionId);
+      Print("Volume: ", dealVolume, " | Profit: ", dealProfit, " | Net: ", profitNet);
+      Print("SL Loss Hits Today: ", g_slHitsToday, "/", InpMaxSLHitsPerDay);
+      
+      // Check if max SL hits reached
+      if(g_slHitsToday >= InpMaxSLHitsPerDay && InpStopTradingOnSLHits)
+      {
+         g_blockedToday = true;
+         Print("=== DAILY STOP TRIGGERED ===");
+         Print("Max SL loss hits (", InpMaxSLHitsPerDay, ") reached. Trading blocked for today.");
+      }
+   }
+   else
+   {
+      // BE stop - do NOT count toward daily limit
+      Print("=== BE STOP (NOT COUNTED) ===");
+      Print("Deal: ", dealTicket, " | Position: ", positionId);
+      Print("Volume: ", dealVolume, " | Profit: ", dealProfit, " | Net: ", profitNet);
+      Print("This was a BE stop, not counting toward SL limit. Current SL Loss Hits: ", g_slHitsToday);
    }
 }
 
@@ -3701,9 +3821,43 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
       Print("MART_DEBUG: BREAKEVEN - level unchanged");
    }
    
+   // === EXIT CLASSIFICATION ===
+   // Classify the exit reason: SL_LOSS, BE_STOP, TP, MANUAL
+   ENUM_DEAL_REASON dealReason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
+   string exitClass = "MANUAL";
+   double commissionEpsilon = 0.50;  // Allow small negative from commission
+   
+   if(dealReason == DEAL_REASON_SL)
+   {
+      // SL triggered - check if actual loss or BE stop
+      if(profitNet < -commissionEpsilon)
+      {
+         exitClass = "SL_LOSS";
+         g_slLossHitsCount++;
+      }
+      else
+      {
+         exitClass = "BE_STOP";
+         g_beStopCount++;
+      }
+   }
+   else if(dealReason == DEAL_REASON_TP)
+   {
+      exitClass = "TP";
+      g_tpHitsCount++;
+   }
+   else
+   {
+      // Other reasons (manual close, etc.)
+      exitClass = "MANUAL";
+      g_manualCloseCount++;
+   }
+   
    // === FINAL CLOSE LOG ===
-   PrintFormat("CLOSE: posId=%I64u net=%.2f martLevel=%d->%d recLoss=%.2f->%.2f",
-               positionId, profitNet, prevMartLevel, g_martLevel, prevRecoveryLoss, g_recoveryLoss);
+   PrintFormat("[CLOSE] deal_reason=%s profit=%.2f classify=%s posId=%I64u",
+               EnumToString(dealReason), profitNet, exitClass, positionId);
+   PrintFormat("CLOSE: posId=%I64u net=%.2f martLevel=%d->%d recLoss=%.2f->%.2f exitClass=%s",
+               positionId, profitNet, prevMartLevel, g_martLevel, prevRecoveryLoss, g_recoveryLoss, exitClass);
    
    // === SAVE TO GLOBALVARIABLE ===
    // Persist martLevel immediately after any change
@@ -4104,7 +4258,14 @@ void ResetDailyCounters()
       // Add TP1 partial close counters to totals
       g_totalTP1PartialTriggered += g_tp1PartialTriggeredCount;
       g_totalTP1PartialFailed += g_tp1PartialFailedCount;
+      g_totalTP1PartialSkipped += g_tp1PartialSkippedCount;
       g_totalBEMoved += g_beMovedCount;
+      
+      // Add exit classification counters to totals
+      g_totalSlLossHits += g_slLossHitsCount;
+      g_totalBeStops += g_beStopCount;
+      g_totalTpHits += g_tpHitsCount;
+      g_totalManualClose += g_manualCloseCount;
    }
    
    g_tradesToday = 0;
@@ -4144,7 +4305,14 @@ void ResetDailyCounters()
    // Reset TP1 partial close counters
    g_tp1PartialTriggeredCount = 0;
    g_tp1PartialFailedCount = 0;
+   g_tp1PartialSkippedCount = 0;
    g_beMovedCount = 0;
+   
+   // Reset exit classification counters
+   g_slLossHitsCount = 0;
+   g_beStopCount = 0;
+   g_tpHitsCount = 0;
+   g_manualCloseCount = 0;
    
    Print("=== DAILY RESET ===");
    Print("Start equity: ", g_dailyStartEquity);
@@ -4158,14 +4326,22 @@ void PrintDailySummary()
 {
    Print("=== DAILY SUMMARY ===");
    Print("Trades executed: ", g_tradesToday);
-   Print("SL Hits: ", g_slHitsToday, "/", InpMaxSLHitsPerDay);
+   Print("SL Loss Hits: ", g_slHitsToday, "/", InpMaxSLHitsPerDay, " (guardrail uses this)");
    Print("Daily PnL: ", DoubleToString(g_dailyPnL, 2));
+   
+   // Exit Classification (Today)
+   Print("--- Exit Classification (Today) ---");
+   Print("  SL_loss_hits: ", g_slLossHitsCount);
+   Print("  BE_stops: ", g_beStopCount);
+   Print("  TP_hits: ", g_tpHitsCount);
+   Print("  Manual_close: ", g_manualCloseCount);
    
    // TP1 Partial Close diagnostics
    Print("--- TP1 Partial Close (Today) ---");
-   Print("  TP1 partial triggered: ", g_tp1PartialTriggeredCount);
-   Print("  TP1 partial failed: ", g_tp1PartialFailedCount, " (last reason: ", g_lastTP1FailReason, ")");
-   Print("  BE moved: ", g_beMovedCount);
+   Print("  PartialTP1_triggers: ", g_tp1PartialTriggeredCount);
+   Print("  PartialTP1_failed: ", g_tp1PartialFailedCount, " (last reason: ", g_lastTP1FailReason, ")");
+   Print("  PartialTP1_skipped: ", g_tp1PartialSkippedCount, " (TP1 too close)");
+   Print("  BE_move_count: ", g_beMovedCount);
    
    // Print microchoch diagnostics by mode
    Print("--- Microchoch Diagnostics (Today) ---");
@@ -4279,14 +4455,28 @@ void PrintFinalSummary()
    Print("Policy: ", InpUseTargetFirstPolicy ? "TARGET-FIRST" : "TIME-BASED");
    Print("");
    
+   // Exit Classification (All Time)
+   int finalSlLossHits = g_totalSlLossHits + g_slLossHitsCount;
+   int finalBeStops = g_totalBeStops + g_beStopCount;
+   int finalTpHits = g_totalTpHits + g_tpHitsCount;
+   int finalManualClose = g_totalManualClose + g_manualCloseCount;
+   Print("--- Exit Classification (All Time) ---");
+   Print("  SL_loss_hits: ", finalSlLossHits);
+   Print("  BE_stops: ", finalBeStops);
+   Print("  TP_hits: ", finalTpHits);
+   Print("  Manual_close: ", finalManualClose);
+   Print("");
+   
    // TP1 Partial Close diagnostics (All Time)
    int finalTP1Triggered = g_totalTP1PartialTriggered + g_tp1PartialTriggeredCount;
    int finalTP1Failed = g_totalTP1PartialFailed + g_tp1PartialFailedCount;
+   int finalTP1Skipped = g_totalTP1PartialSkipped + g_tp1PartialSkippedCount;
    int finalBEMoved = g_totalBEMoved + g_beMovedCount;
    Print("--- TP1 Partial Close (All Time) ---");
-   Print("  TP1 partial triggered: ", finalTP1Triggered);
-   Print("  TP1 partial failed: ", finalTP1Failed);
-   Print("  BE moved: ", finalBEMoved);
+   Print("  PartialTP1_triggers: ", finalTP1Triggered);
+   Print("  PartialTP1_failed: ", finalTP1Failed);
+   Print("  PartialTP1_skipped: ", finalTP1Skipped, " (TP1 too close)");
+   Print("  BE_move_count: ", finalBEMoved);
    if(finalTP1Triggered > 0)
    {
       double successRate = (double)finalTP1Triggered / (finalTP1Triggered + finalTP1Failed) * 100;
