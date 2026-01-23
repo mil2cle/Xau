@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v2.7                         |
+//|                    SMC Scalping Bot v2.8                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v2.7"
+#property copyright "SMC Scalping Bot v2.8"
 #property link      ""
-#property version   "2.70"
+#property version   "2.80"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -522,7 +522,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v2.7 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v2.8 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -539,6 +539,7 @@ int OnInit()
    Print("NoTrade Zone: ", InpNoTradeStartHHMM, "-", InpNoTradeEndHHMM, " | Hard Block: ", InpEnableHardBlock ? StringFormat("%04d", InpHardBlockAfterHHMM) : "OFF");
    Print("24h Trading: ", InpEnable24hTrading, " | CSV Logging: ", InpEnableCSVLogging);
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
+   Print("Martingale: Mode=", EnumToString(InpMartingaleMode), " | Mult=", InpMartMultiplier, " | MaxLvl=", InpMartMaxLevel, " | StrictOnly=", InpMartingaleStrictOnly);
    
    return(INIT_SUCCEEDED);
 }
@@ -581,7 +582,7 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot v2.7 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v2.8 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -697,8 +698,11 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       // A deal was added - check if it's ours
       if(trans.symbol == tradeSym)
       {
-         // Check for SL hit
+         // Check for SL hit (for daily SL counter)
          CheckDealForSLHit(trans.deal);
+         
+         // Update martingale level based on deal result
+         UpdateMartingaleFromDeal(trans.deal);
       }
    }
 }
@@ -1793,9 +1797,12 @@ void PlaceOrder()
    sl = NormalizeDouble(sl, _Digits);
    tp = NormalizeDouble(tp, _Digits);
    
-   string comment = StringFormat("SMC_%s_L%d", 
+   // Comment format: SMC_LONG_L0_M_S (S=StrictOnly, A=AllModes)
+   string strictOnlyStr = InpMartingaleStrictOnly ? "S" : "A";
+   string comment = StringFormat("SMC_%s_L%d_M%s", 
                                  g_sweepType == SWEEP_BULLISH ? "LONG" : "SHORT",
-                                 g_martLevel);
+                                 g_martLevel,
+                                 strictOnlyStr);
    
    if(trade.PositionOpen(tradeSym, orderType, g_currentLot, price, sl, tp, comment))
    {
@@ -1805,6 +1812,11 @@ void PlaceOrder()
       g_tradesToday++;
       g_lastTradeTime = TimeCurrent();  // Update last trade time for cooldown
       g_state = STATE_MANAGE_TRADE;
+      
+      // Detailed martingale entry log
+      PrintFormat("MART_ENTRY: dir=%s level=%d base=%.2f mult=%.2f final=%.2f comment=%s",
+                  g_sweepType == SWEEP_BULLISH ? "LONG" : "SHORT",
+                  g_martLevel, InpBaseLot, MathPow(InpMartMultiplier, g_martLevel), g_currentLot, comment);
       
       Print("Order placed: ", EnumToString(orderType), " Lot: ", g_currentLot, 
             " Entry: ", price, " SL: ", sl, " TP1: ", tp, " Mode: ", EnumToString(g_tradeMode));
@@ -2039,6 +2051,9 @@ void ManageTrade()
 //+------------------------------------------------------------------+
 void CheckTradeResult()
 {
+   // NOTE: Martingale level is now updated in UpdateMartingaleFromDeal() via OnTradeTransaction
+   // This function only handles logging and daily PnL tracking
+   
    // Get last deal result
    HistorySelect(TimeCurrent() - 86400, TimeCurrent());
    
@@ -2059,20 +2074,10 @@ void CheckTradeResult()
    if(totalPnL > 0)
    {
       result = "win";
-      g_consecLosses = 0;
-      g_martLevel = 0;
-      g_currentLot = InpBaseLot;
    }
    else if(totalPnL < 0)
    {
       result = "lose";
-      g_consecLosses++;
-      
-      // Martingale adjustment
-      if(InpMartingaleMode == MART_AFTER_LOSS && g_martLevel < InpMartMaxLevel)
-      {
-         g_martLevel++;
-      }
    }
    else
    {
@@ -2082,7 +2087,7 @@ void CheckTradeResult()
    // Log trade
    LogTrade(result, totalPnL);
    
-   Print("Trade closed: ", result, " PnL: ", totalPnL, " Consec losses: ", g_consecLosses);
+   Print("Trade closed: ", result, " PnL: ", totalPnL, " Consec losses: ", g_consecLosses, " MartLevel: ", g_martLevel);
 }
 
 //=== RISK MANAGEMENT ===
@@ -2455,65 +2460,82 @@ void LogBiasNone(string reason)
 
 //+------------------------------------------------------------------+
 //| Calculate lot size with martingale and mode adjustments            |
+//| Order: baseLot -> martingale -> modeFactor -> biasNoneFactor -> cap -> normalize
 //+------------------------------------------------------------------+
 double CalculateLot()
 {
-   double lot = InpBaseLot;
+   double baseLot = InpBaseLot;
+   double lot = baseLot;
    
-   // In RELAX/RELAX2 mode: no martingale if InpMartingaleStrictOnly is true
+   // Determine if martingale is allowed
    bool allowMartingale = true;
+   string martStatus = "ALLOWED";
+   
+   // Check mode restriction
    if((g_tradeMode == MODE_RELAX || g_tradeMode == MODE_RELAX2) && InpMartingaleStrictOnly)
    {
       allowMartingale = false;
+      martStatus = "DISABLED_MODE";
    }
    
-   // Apply martingale only if allowed and NOT trading with bias none
-   if(InpMartingaleMode == MART_AFTER_LOSS && g_martLevel > 0 && allowMartingale)
+   // Check bias none restriction
+   if(g_tradingWithBiasNone)
    {
-      if(g_tradingWithBiasNone)
-      {
-         // Martingale disabled when trading with bias none
-         Print("Martingale disabled for BIAS_NONE trade. Using base lot.");
-         lot = InpBaseLot;
-      }
-      else
-      {
-         lot = InpBaseLot * MathPow(InpMartMultiplier, g_martLevel);
-      }
-   }
-   else if(!allowMartingale && g_martLevel > 0)
-   {
-      Print("Martingale disabled in ", EnumToString(g_tradeMode), ". Using base lot.");
-      lot = InpBaseLot;
+      allowMartingale = false;
+      martStatus = "DISABLED_BIASNONE";
    }
    
-   // Apply mode-based lot factor
+   // Check if martingale mode is enabled
+   if(InpMartingaleMode != MART_AFTER_LOSS)
+   {
+      allowMartingale = false;
+      martStatus = "DISABLED_OFF";
+   }
+   
+   // Apply martingale multiplier if allowed and level > 0
+   double martMultiplier = 1.0;
+   if(allowMartingale && g_martLevel > 0)
+   {
+      martMultiplier = MathPow(InpMartMultiplier, g_martLevel);
+      lot = baseLot * martMultiplier;
+   }
+   
+   // Apply mode-based lot factor (RELAX/RELAX2 reduction)
    double lotFactor = GetLotFactor();
+   double lotAfterFactor = lot;
    if(lotFactor < 1.0)
    {
-      lot = lot * lotFactor;
-      Print("Applying ", EnumToString(g_tradeMode), " lot factor: ", lotFactor, " -> Lot: ", lot);
+      lotAfterFactor = lot * lotFactor;
    }
+   lot = lotAfterFactor;
    
    // Apply bias none lot factor if trading without bias (additional reduction)
+   double lotAfterBias = lot;
    if(g_tradingWithBiasNone && g_tradeMode == MODE_STRICT)
    {
-      lot = lot * InpBiasNoneLotFactor;
-      Print("Applying BIAS_NONE lot factor: ", InpBiasNoneLotFactor, " -> Lot: ", lot);
+      lotAfterBias = lot * InpBiasNoneLotFactor;
    }
+   lot = lotAfterBias;
    
    // Apply cap
-   lot = MathMin(lot, InpLotCapMax);
+   double lotAfterCap = MathMin(lot, InpLotCapMax);
+   lot = lotAfterCap;
    
-   // Normalize
+   // Normalize to symbol specifications
    double minLot = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_STEP);
    
    lot = MathMax(minLot, MathMin(maxLot, lot));
    lot = MathFloor(lot / lotStep) * lotStep;
+   double finalLot = NormalizeDouble(lot, 2);
    
-   return NormalizeDouble(lot, 2);
+   // Debug log - always print for martingale tracking
+   string strictOnlyStr = InpMartingaleStrictOnly ? "S" : "A";
+   PrintFormat("MART_CALC: mode=%s level=%d base=%.2f mult=%.2f factor=%.2f final=%.2f status=%s",
+               EnumToString(g_tradeMode), g_martLevel, baseLot, martMultiplier, lotFactor, finalLot, martStatus);
+   
+   return finalLot;
 }
 
 //=== TRADE MODE (STRICT/RELAX) ===
@@ -2909,6 +2931,85 @@ void CheckDealForSLHit(ulong dealTicket)
       Print("=== DAILY STOP TRIGGERED ===");
       Print("Max SL hits (", InpMaxSLHitsPerDay, ") reached. Trading blocked for today.");
    }
+}
+
+//+------------------------------------------------------------------+
+//| Update martingale level from deal result                            |
+//| Called from OnTradeTransaction for accurate martLevel tracking      |
+//+------------------------------------------------------------------+
+void UpdateMartingaleFromDeal(ulong dealTicket)
+{
+   if(dealTicket == 0) return;
+   
+   // Select deal from history
+   if(!HistoryDealSelect(dealTicket))
+   {
+      datetime dayStart = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+      HistorySelect(dayStart, TimeCurrent() + 3600);
+      if(!HistoryDealSelect(dealTicket))
+         return;
+   }
+   
+   // Check if it's an exit deal (DEAL_ENTRY_OUT)
+   ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+   if(dealEntry != DEAL_ENTRY_OUT)
+      return;
+   
+   // Check symbol
+   string dealSymbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+   if(dealSymbol != tradeSym)
+      return;
+   
+   // Check magic number
+   long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+   if(dealMagic != InpMagic)
+      return;
+   
+   // Get profit including commission and swap
+   double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+   double dealCommission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+   double dealSwap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
+   double profitNet = dealProfit + dealCommission + dealSwap;
+   
+   // Get deal volume for logging
+   double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+   
+   // Store previous level for logging
+   int prevMartLevel = g_martLevel;
+   
+   // Update martingale level
+   if(profitNet > 0)
+   {
+      // Win: reset to level 0
+      g_martLevel = 0;
+      g_consecLosses = 0;
+      g_currentLot = InpBaseLot;
+   }
+   else if(profitNet < 0)
+   {
+      // Loss: increment level (capped)
+      g_consecLosses++;
+      if(InpMartingaleMode == MART_AFTER_LOSS && g_martLevel < InpMartMaxLevel)
+      {
+         g_martLevel++;
+      }
+   }
+   // profitNet == 0: breakeven, keep current level
+   
+   // Calculate what next lot will be
+   double nextLot = InpBaseLot * MathPow(InpMartMultiplier, g_martLevel);
+   nextLot = MathMin(nextLot, InpLotCapMax);
+   
+   // Normalize
+   double minLot = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_STEP);
+   nextLot = MathMax(minLot, MathMin(maxLot, nextLot));
+   nextLot = MathFloor(nextLot / lotStep) * lotStep;
+   
+   // Debug log
+   PrintFormat("MART_UPDATE: deal=%I64u profit=%.2f (net=%.2f) vol=%.2f | level: %d->%d | nextLot=%.2f",
+               dealTicket, dealProfit, profitNet, dealVolume, prevMartLevel, g_martLevel, nextLot);
 }
 
 //+------------------------------------------------------------------+
@@ -3918,7 +4019,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.7", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.8", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
