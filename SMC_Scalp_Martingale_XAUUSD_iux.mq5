@@ -1861,6 +1861,10 @@ void LookForRetrace()
 //+------------------------------------------------------------------+
 void PlaceOrder()
 {
+   // Declare variables at the beginning of function
+   ENUM_ORDER_TYPE orderType;
+   double price = 0, sl = 0, tp = 0;
+   
    // Final risk check
    if(!PassRiskChecks())
    {
