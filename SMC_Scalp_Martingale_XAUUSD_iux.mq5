@@ -485,7 +485,7 @@ int            g_totalManualClose = 0;
 bool           g_tp1PartialDisabled = false;    // Set in PlaceOrder if tp1Pts < InpMinTP1Points
 
 // Trailing Stop tracking (per position)
-double         g_entryPrice = 0;                 // Entry price for current position
+// Note: g_entryPrice is already declared in Trade management section
 int            g_initialRiskPoints = 0;          // Initial risk (abs(entry-sl)/_Point) at entry
 datetime       g_lastTrailModifyTime = 0;        // Last time trailing modified SL
 
