@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v3.2                         |
+//|                    SMC Scalping Bot v3.3                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v3.2"
+#property copyright "SMC Scalping Bot v3.3"
 #property link      ""
-#property version   "3.20"
+#property version   "3.30"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -1897,6 +1897,12 @@ void PlaceOrder()
    g_currentLot = CalculateLot();
    double finalLotUsed = g_currentLot;
    
+   // === DEBUG: Show recovery status ===
+   bool inRecovery = (g_recoveryLoss > 0);
+   PrintFormat("MART_STATUS: level=%d recLoss=%.2f inRecovery=%d base=%.2f mult=%.2f expectedLot=%.2f",
+               g_martLevel, g_recoveryLoss, inRecovery, InpBaseLot, InpMartMultiplier,
+               InpBaseLot * MathPow(InpMartMultiplier, g_martLevel));
+   
    PrintFormat("ENTRY_PREP: martLevelUsed=%d finalLotUsed=%.2f signature=%s recLoss=%.2f",
                martLevelUsed, finalLotUsed, g_lastSetupSignature, g_recoveryLoss);
    
@@ -2812,6 +2818,10 @@ bool CheckSameSetup()
    if(g_lastSetupSignature == "")
       return true;
    
+   // === CRITICAL: If recoveryLoss > 0, NEVER reset martLevel ===
+   // Must continue recovery regardless of setup change
+   bool inRecoveryMode = (g_recoveryLoss > 0);
+   
    // Check bars since last loss
    int currentBar = iBarShift(tradeSym, InpEntryTF, TimeCurrent());
    int barsSinceLoss = g_lastLossBarIndex - currentBar;  // Note: bar index decreases over time
@@ -2819,42 +2829,62 @@ bool CheckSameSetup()
    
    if(barsSinceLoss > InpMartMaxBarsSinceLoss)
    {
-      PrintFormat("SAME_SETUP: Bars since loss (%d) > max (%d) - %s martLevel",
-                  barsSinceLoss, InpMartMaxBarsSinceLoss,
-                  InpMartResetIfSetupChanged ? "RESET" : "KEEP");
-      
-      if(InpMartResetIfSetupChanged)
+      if(inRecoveryMode)
       {
-         g_martLevel = 0;
-         g_recoveryLoss = 0;
-         g_lastSetupSignature = "";
-         // Save to GlobalVariable
-         if(g_martLevelKey != "") GlobalVariableSet(g_martLevelKey, g_martLevel);
-         if(g_recoveryLossKey != "") GlobalVariableSet(g_recoveryLossKey, g_recoveryLoss);
+         // In recovery mode: DO NOT reset, just log and continue
+         PrintFormat("SAME_SETUP: Bars since loss (%d) > max (%d) but IN RECOVERY (recLoss=%.2f) - KEEP martLevel=%d",
+                     barsSinceLoss, InpMartMaxBarsSinceLoss, g_recoveryLoss, g_martLevel);
+         return true;  // Allow trade to continue recovery
       }
-      return false;
+      else
+      {
+         PrintFormat("SAME_SETUP: Bars since loss (%d) > max (%d) - %s martLevel",
+                     barsSinceLoss, InpMartMaxBarsSinceLoss,
+                     InpMartResetIfSetupChanged ? "RESET" : "KEEP");
+         
+         if(InpMartResetIfSetupChanged)
+         {
+            g_martLevel = 0;
+            g_recoveryLoss = 0;
+            g_lastSetupSignature = "";
+            // Save to GlobalVariable
+            if(g_martLevelKey != "") GlobalVariableSet(g_martLevelKey, g_martLevel);
+            if(g_recoveryLossKey != "") GlobalVariableSet(g_recoveryLossKey, g_recoveryLoss);
+         }
+         return false;
+      }
    }
    
    // Check signature match
    string currentSignature = GetSetupSignature();
    bool match = (currentSignature == g_lastSetupSignature);
    
-   PrintFormat("SAME_SETUP: current=%s last=%s match=%d barsSinceLoss=%d",
-               currentSignature, g_lastSetupSignature, match, barsSinceLoss);
+   PrintFormat("SAME_SETUP: current=%s last=%s match=%d barsSinceLoss=%d inRecovery=%d",
+               currentSignature, g_lastSetupSignature, match, barsSinceLoss, inRecoveryMode);
    
-   if(!match && InpMartResetIfSetupChanged)
+   if(!match)
    {
-      PrintFormat("SAME_SETUP: Signature mismatch - RESET martLevel from %d to 0", g_martLevel);
-      g_martLevel = 0;
-      g_recoveryLoss = 0;
-      g_lastSetupSignature = "";
-      // Save to GlobalVariable
-      if(g_martLevelKey != "") GlobalVariableSet(g_martLevelKey, g_martLevel);
-      if(g_recoveryLossKey != "") GlobalVariableSet(g_recoveryLossKey, g_recoveryLoss);
-      return false;
+      if(inRecoveryMode)
+      {
+         // In recovery mode: DO NOT reset, just log and continue
+         PrintFormat("SAME_SETUP: Signature mismatch but IN RECOVERY (recLoss=%.2f) - KEEP martLevel=%d",
+                     g_recoveryLoss, g_martLevel);
+         return true;  // Allow trade to continue recovery
+      }
+      else if(InpMartResetIfSetupChanged)
+      {
+         PrintFormat("SAME_SETUP: Signature mismatch - RESET martLevel from %d to 0", g_martLevel);
+         g_martLevel = 0;
+         g_recoveryLoss = 0;
+         g_lastSetupSignature = "";
+         // Save to GlobalVariable
+         if(g_martLevelKey != "") GlobalVariableSet(g_martLevelKey, g_martLevel);
+         if(g_recoveryLossKey != "") GlobalVariableSet(g_recoveryLossKey, g_recoveryLoss);
+         return false;
+      }
    }
    
-   return match;
+   return match || inRecoveryMode;  // Allow if match OR in recovery
 }
 
 //=== TRADE MODE (STRICT/RELAX) ===
