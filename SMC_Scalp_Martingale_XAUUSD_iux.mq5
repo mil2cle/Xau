@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v2.8                         |
+//|                    SMC Scalping Bot v2.9                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v2.8"
+#property copyright "SMC Scalping Bot v2.9"
 #property link      ""
-#property version   "2.80"
+#property version   "2.90"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -522,7 +522,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v2.8 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v2.9 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -582,7 +582,7 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot v2.8 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v2.9 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -693,16 +693,30 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    // Check for daily reset first
    DailyResetIfNeeded();
    
+   // DEBUG: Log all transaction types
+   PrintFormat("TRANS_DEBUG: type=%d symbol=%s deal=%I64u order=%I64u",
+               trans.type, trans.symbol, trans.deal, trans.order);
+   
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
+      PrintFormat("TRANS_DEBUG: DEAL_ADD detected - symbol=%s tradeSym=%s deal=%I64u",
+                  trans.symbol, tradeSym, trans.deal);
+      
       // A deal was added - check if it's ours
       if(trans.symbol == tradeSym)
       {
+         Print("TRANS_DEBUG: Symbol matches, processing deal...");
+         
          // Check for SL hit (for daily SL counter)
          CheckDealForSLHit(trans.deal);
          
          // Update martingale level based on deal result
          UpdateMartingaleFromDeal(trans.deal);
+      }
+      else
+      {
+         PrintFormat("TRANS_DEBUG: Symbol mismatch - trans.symbol=%s tradeSym=%s",
+                     trans.symbol, tradeSym);
       }
    }
 }
@@ -2939,31 +2953,59 @@ void CheckDealForSLHit(ulong dealTicket)
 //+------------------------------------------------------------------+
 void UpdateMartingaleFromDeal(ulong dealTicket)
 {
-   if(dealTicket == 0) return;
+   // DEBUG: Function called
+   PrintFormat("MART_DEBUG: UpdateMartingaleFromDeal called with deal=%I64u", dealTicket);
    
-   // Select deal from history
+   if(dealTicket == 0)
+   {
+      Print("MART_DEBUG: dealTicket is 0, returning");
+      return;
+   }
+   
+   // IMPORTANT: Always call HistorySelect first to load history
+   datetime dayStart = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+   if(!HistorySelect(dayStart, TimeCurrent() + 3600))
+   {
+      Print("MART_DEBUG: HistorySelect failed");
+      return;
+   }
+   
+   // Now select the specific deal
    if(!HistoryDealSelect(dealTicket))
    {
-      datetime dayStart = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
-      HistorySelect(dayStart, TimeCurrent() + 3600);
-      if(!HistoryDealSelect(dealTicket))
-         return;
+      PrintFormat("MART_DEBUG: HistoryDealSelect failed for deal=%I64u", dealTicket);
+      return;
    }
    
    // Check if it's an exit deal (DEAL_ENTRY_OUT)
    ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+   PrintFormat("MART_DEBUG: dealEntry=%d (OUT=%d)", dealEntry, DEAL_ENTRY_OUT);
+   
    if(dealEntry != DEAL_ENTRY_OUT)
+   {
+      Print("MART_DEBUG: Not an exit deal, returning");
       return;
+   }
    
    // Check symbol
    string dealSymbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+   PrintFormat("MART_DEBUG: dealSymbol=%s tradeSym=%s", dealSymbol, tradeSym);
+   
    if(dealSymbol != tradeSym)
+   {
+      Print("MART_DEBUG: Symbol mismatch, returning");
       return;
+   }
    
    // Check magic number
    long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+   PrintFormat("MART_DEBUG: dealMagic=%I64d InpMagic=%I64d", dealMagic, InpMagic);
+   
    if(dealMagic != InpMagic)
+   {
+      Print("MART_DEBUG: Magic mismatch, returning");
       return;
+   }
    
    // Get profit including commission and swap
    double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
@@ -2973,6 +3015,9 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
    
    // Get deal volume for logging
    double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+   
+   PrintFormat("MART_DEBUG: profit=%.2f comm=%.2f swap=%.2f net=%.2f vol=%.2f",
+               dealProfit, dealCommission, dealSwap, profitNet, dealVolume);
    
    // Store previous level for logging
    int prevMartLevel = g_martLevel;
@@ -2984,17 +3029,29 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
       g_martLevel = 0;
       g_consecLosses = 0;
       g_currentLot = InpBaseLot;
+      PrintFormat("MART_DEBUG: WIN - reset level to 0");
    }
    else if(profitNet < 0)
    {
       // Loss: increment level (capped)
       g_consecLosses++;
+      PrintFormat("MART_DEBUG: LOSS - MartMode=%d level=%d maxLevel=%d",
+                  InpMartingaleMode, g_martLevel, InpMartMaxLevel);
+      
       if(InpMartingaleMode == MART_AFTER_LOSS && g_martLevel < InpMartMaxLevel)
       {
          g_martLevel++;
+         PrintFormat("MART_DEBUG: Level incremented to %d", g_martLevel);
+      }
+      else
+      {
+         PrintFormat("MART_DEBUG: Level NOT incremented (mode=%d or at max)", InpMartingaleMode);
       }
    }
-   // profitNet == 0: breakeven, keep current level
+   else
+   {
+      Print("MART_DEBUG: BREAKEVEN - level unchanged");
+   }
    
    // Calculate what next lot will be
    double nextLot = InpBaseLot * MathPow(InpMartMultiplier, g_martLevel);
@@ -3007,7 +3064,7 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
    nextLot = MathMax(minLot, MathMin(maxLot, nextLot));
    nextLot = MathFloor(nextLot / lotStep) * lotStep;
    
-   // Debug log
+   // Final summary log
    PrintFormat("MART_UPDATE: deal=%I64u profit=%.2f (net=%.2f) vol=%.2f | level: %d->%d | nextLot=%.2f",
                dealTicket, dealProfit, profitNet, dealVolume, prevMartLevel, g_martLevel, nextLot);
 }
@@ -4019,7 +4076,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.8", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.9", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
