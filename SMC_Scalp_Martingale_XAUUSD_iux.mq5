@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v2.9                         |
+//|                    SMC Scalping Bot v3.0                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v2.9"
+#property copyright "SMC Scalping Bot v3.0"
 #property link      ""
-#property version   "2.90"
+#property version   "3.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -301,6 +301,7 @@ datetime       g_lastTradeTime = 0;        // Time of last trade (for cooldown)
 // Martingale
 int            g_martLevel = 0;
 double         g_currentLot = 0;
+string         g_martLevelKey = "";  // GlobalVariable key for persistence
 
 // Logging
 int            g_tradesFileHandle = INVALID_HANDLE;
@@ -469,6 +470,23 @@ int OnInit()
    g_tradeMode = MODE_STRICT;
    g_prevTradeMode = MODE_STRICT;
    
+   // === MARTINGALE PERSISTENCE ===
+   // Create GlobalVariable key for this symbol+magic combination
+   g_martLevelKey = "MART_LEVEL_" + tradeSym + "_" + IntegerToString(InpMagic);
+   
+   // Load martLevel from GlobalVariable if exists (persistence across restarts)
+   if(GlobalVariableCheck(g_martLevelKey))
+   {
+      g_martLevel = (int)GlobalVariableGet(g_martLevelKey);
+      PrintFormat("MART_PERSIST: Loaded martLevel=%d from GlobalVariable key=%s", g_martLevel, g_martLevelKey);
+   }
+   else
+   {
+      g_martLevel = 0;
+      GlobalVariableSet(g_martLevelKey, g_martLevel);
+      PrintFormat("MART_PERSIST: Created new GlobalVariable key=%s with martLevel=0", g_martLevelKey);
+   }
+   
    // Initialize spread history for spike detection
    ArrayResize(g_spreadHistory, g_spreadHistorySize);
    ArrayResize(g_spreadTimeHistory, g_spreadHistorySize);
@@ -522,7 +540,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v2.9 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v3.0 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -582,7 +600,15 @@ void OnDeinit(const int reason)
    // Remove visual objects
    ObjectsDeleteAll(0, g_objPrefix);
    
-   Print("SMC Scalping Bot v2.9 deinitialized. Reason: ", reason);
+   // === MARTINGALE PERSISTENCE ===
+   // Save martLevel to GlobalVariable for persistence across restarts
+   if(g_martLevelKey != "")
+   {
+      GlobalVariableSet(g_martLevelKey, g_martLevel);
+      PrintFormat("MART_PERSIST: Saved martLevel=%d to GlobalVariable key=%s", g_martLevel, g_martLevelKey);
+   }
+   
+   Print("SMC Scalping Bot v3.0 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -3053,6 +3079,14 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
       Print("MART_DEBUG: BREAKEVEN - level unchanged");
    }
    
+   // === SAVE TO GLOBALVARIABLE ===
+   // Persist martLevel immediately after any change
+   if(g_martLevelKey != "")
+   {
+      GlobalVariableSet(g_martLevelKey, g_martLevel);
+      PrintFormat("MART_PERSIST: Saved martLevel=%d to GlobalVariable (after deal close)", g_martLevel);
+   }
+   
    // Calculate what next lot will be
    double nextLot = InpBaseLot * MathPow(InpMartMultiplier, g_martLevel);
    nextLot = MathMin(nextLot, InpLotCapMax);
@@ -3439,8 +3473,11 @@ void ResetDailyCounters()
    g_consecLosses = 0;
    g_dailyPnL = 0;
    g_dailyStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   g_martLevel = 0;
-   g_currentLot = InpBaseLot;
+   
+   // NOTE: martLevel is NOT reset on new day - it persists until a winning trade
+   // g_martLevel = 0;  // REMOVED - martingale continues across days
+   // g_currentLot = InpBaseLot;  // REMOVED - lot is calculated from martLevel
+   PrintFormat("MART_PERSIST: New day - martLevel=%d persists (not reset)", g_martLevel);
    
    // Reset trade mode to STRICT at start of day
    g_tradeMode = MODE_STRICT;
@@ -4076,7 +4113,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v2.9", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v3.0", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
