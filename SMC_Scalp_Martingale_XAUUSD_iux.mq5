@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v3.0                         |
+//|                    SMC Scalping Bot v3.1                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + No-Trade Zone + Hard Block + Daily Loss Fix            |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v3.0"
+#property copyright "SMC Scalping Bot v3.1"
 #property link      ""
-#property version   "3.00"
+#property version   "3.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -234,6 +234,18 @@ input double   InpMartMultiplier    = 2.0;            // Martingale multiplier
 input int      InpMartMaxLevel      = 3;              // Max martingale level
 input double   InpLotCapMax         = 0.08;           // Max lot cap
 
+input group "=== Recovery TP (Martingale) ==="
+input bool     InpUseRecoveryTP     = true;           // Use Recovery TP when martLevel>0
+input double   InpRecoveryFactor    = 1.05;           // Recovery factor (1.05 = recover 105%)
+input double   InpRecoveryBufferMoney = 0.0;          // Extra buffer money to recover ($)
+input int      InpMaxTPPoints       = 2000;           // Max TP distance (points)
+input int      InpMinTPPoints       = 100;            // Min TP distance (points)
+
+input group "=== Same Setup Only (Martingale) ==="
+input bool     InpMartSameSetupOnly = true;           // Only continue mart if same setup
+input int      InpMartMaxBarsSinceLoss = 200;         // Max bars since loss to continue mart
+input bool     InpMartResetIfSetupChanged = true;     // Reset martLevel if setup changed
+
 input group "=== Visual ==="
 input bool     InpShowPanel         = true;           // Show info panel
 input bool     InpShowLiquidity     = true;           // Show liquidity lines
@@ -302,6 +314,15 @@ datetime       g_lastTradeTime = 0;        // Time of last trade (for cooldown)
 int            g_martLevel = 0;
 double         g_currentLot = 0;
 string         g_martLevelKey = "";  // GlobalVariable key for persistence
+
+// Recovery TP
+double         g_recoveryLoss = 0;           // Cumulative loss to recover
+string         g_recoveryLossKey = "";       // GlobalVariable key for persistence
+
+// Same Setup Only
+string         g_lastSetupSignature = "";   // Signature of last losing trade setup
+datetime       g_lastLossTime = 0;           // Time of last loss (for bars since loss)
+int            g_lastLossBarIndex = 0;       // Bar index of last loss
 
 // Logging
 int            g_tradesFileHandle = INVALID_HANDLE;
@@ -473,6 +494,7 @@ int OnInit()
    // === MARTINGALE PERSISTENCE ===
    // Create GlobalVariable key for this symbol+magic combination
    g_martLevelKey = "MART_LEVEL_" + tradeSym + "_" + IntegerToString(InpMagic);
+   g_recoveryLossKey = "MART_RECLOSS_" + tradeSym + "_" + IntegerToString(InpMagic);
    
    // Load martLevel from GlobalVariable if exists (persistence across restarts)
    if(GlobalVariableCheck(g_martLevelKey))
@@ -485,6 +507,19 @@ int OnInit()
       g_martLevel = 0;
       GlobalVariableSet(g_martLevelKey, g_martLevel);
       PrintFormat("MART_PERSIST: Created new GlobalVariable key=%s with martLevel=0", g_martLevelKey);
+   }
+   
+   // Load recoveryLoss from GlobalVariable if exists
+   if(GlobalVariableCheck(g_recoveryLossKey))
+   {
+      g_recoveryLoss = GlobalVariableGet(g_recoveryLossKey);
+      PrintFormat("MART_PERSIST: Loaded recoveryLoss=%.2f from GlobalVariable key=%s", g_recoveryLoss, g_recoveryLossKey);
+   }
+   else
+   {
+      g_recoveryLoss = 0;
+      GlobalVariableSet(g_recoveryLossKey, g_recoveryLoss);
+      PrintFormat("MART_PERSIST: Created new GlobalVariable key=%s with recoveryLoss=0", g_recoveryLossKey);
    }
    
    // Initialize spread history for spike detection
@@ -540,7 +575,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v3.0 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v3.1 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -558,6 +593,9 @@ int OnInit()
    Print("24h Trading: ", InpEnable24hTrading, " | CSV Logging: ", InpEnableCSVLogging);
    Print("Spread: STRICT=", InpMaxSpreadStrict, " RELAX=", InpMaxSpreadRelax, " Rollover=", InpMaxSpreadRollover, " | Spike mult=", InpSpreadSpikeMultiplier);
    Print("Martingale: Mode=", EnumToString(InpMartingaleMode), " | Mult=", InpMartMultiplier, " | MaxLvl=", InpMartMaxLevel, " | StrictOnly=", InpMartingaleStrictOnly);
+   Print("Recovery TP: Enabled=", InpUseRecoveryTP, " | Factor=", InpRecoveryFactor, " | Buffer=", InpRecoveryBufferMoney, 
+         " | MinTP=", InpMinTPPoints, " | MaxTP=", InpMaxTPPoints);
+   Print("Same Setup: Enabled=", InpMartSameSetupOnly, " | MaxBars=", InpMartMaxBarsSinceLoss, " | ResetIfChanged=", InpMartResetIfSetupChanged);
    
    return(INIT_SUCCEEDED);
 }
@@ -608,7 +646,14 @@ void OnDeinit(const int reason)
       PrintFormat("MART_PERSIST: Saved martLevel=%d to GlobalVariable key=%s", g_martLevel, g_martLevelKey);
    }
    
-   Print("SMC Scalping Bot v3.0 deinitialized. Reason: ", reason);
+   // Save recoveryLoss to GlobalVariable
+   if(g_recoveryLossKey != "")
+   {
+      GlobalVariableSet(g_recoveryLossKey, g_recoveryLoss);
+      PrintFormat("MART_PERSIST: Saved recoveryLoss=%.2f to GlobalVariable key=%s", g_recoveryLoss, g_recoveryLossKey);
+   }
+   
+   Print("SMC Scalping Bot v3.1 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -1817,6 +1862,21 @@ void PlaceOrder()
    double price, sl, tp;
    ENUM_ORDER_TYPE orderType;
    
+   // === SAME SETUP ONLY CHECK ===
+   // Check if martingale should continue based on setup signature
+   if(g_martLevel > 0 && InpMartSameSetupOnly)
+   {
+      if(!CheckSameSetup())
+      {
+         PrintFormat("SAME_SETUP: Setup changed or timeout - martLevel was reset");
+         // martLevel was reset in CheckSameSetup(), continue with L0
+      }
+   }
+   
+   // Store current setup signature (for next loss comparison)
+   g_lastSetupSignature = GetSetupSignature();
+   PrintFormat("SETUP_SIG: Stored signature=%s for martLevel=%d", g_lastSetupSignature, g_martLevel);
+   
    if(g_sweepType == SWEEP_BULLISH)
    {
       orderType = ORDER_TYPE_BUY;
@@ -1837,12 +1897,39 @@ void PlaceOrder()
    sl = NormalizeDouble(sl, _Digits);
    tp = NormalizeDouble(tp, _Digits);
    
-   // Comment format: SMC_LONG_L0_M_S (S=StrictOnly, A=AllModes)
+   // === RECOVERY TP ===
+   // Calculate Recovery TP if martLevel > 0
+   double recoveryTP = CalculateRecoveryTP(price, g_currentLot, g_sweepType == SWEEP_BULLISH);
+   double originalTP = tp;
+   int recoveryTPPoints = 0;
+   
+   if(recoveryTP > 0)
+   {
+      // Use Recovery TP instead of normal TP
+      tp = recoveryTP;
+      recoveryTPPoints = (int)MathAbs((tp - price) / _Point);
+      PrintFormat("REC_TP: Using Recovery TP=%.5f instead of normal TP=%.5f (recLoss=%.2f)",
+                  tp, originalTP, g_recoveryLoss);
+   }
+   
+   // Comment format: SMC_LONG_L0_MA_REC{tpPoints} (MA=AllModes, REC=Recovery TP points)
    string strictOnlyStr = InpMartingaleStrictOnly ? "S" : "A";
-   string comment = StringFormat("SMC_%s_L%d_M%s", 
-                                 g_sweepType == SWEEP_BULLISH ? "LONG" : "SHORT",
-                                 g_martLevel,
-                                 strictOnlyStr);
+   string comment;
+   if(recoveryTP > 0)
+   {
+      comment = StringFormat("SMC_%s_L%d_M%s_R%d", 
+                             g_sweepType == SWEEP_BULLISH ? "LONG" : "SHORT",
+                             g_martLevel,
+                             strictOnlyStr,
+                             recoveryTPPoints);
+   }
+   else
+   {
+      comment = StringFormat("SMC_%s_L%d_M%s", 
+                             g_sweepType == SWEEP_BULLISH ? "LONG" : "SHORT",
+                             g_martLevel,
+                             strictOnlyStr);
+   }
    
    if(trade.PositionOpen(tradeSym, orderType, g_currentLot, price, sl, tp, comment))
    {
@@ -2578,6 +2665,144 @@ double CalculateLot()
    return finalLot;
 }
 
+//+------------------------------------------------------------------+
+//| Calculate Recovery TP price                                         |
+//| Returns TP price that will recover cumulative losses + buffer       |
+//+------------------------------------------------------------------+
+double CalculateRecoveryTP(double entryPrice, double lot, bool isBuy)
+{
+   // If Recovery TP is disabled or martLevel is 0, return 0 (use normal TP)
+   if(!InpUseRecoveryTP || g_martLevel == 0 || g_recoveryLoss <= 0)
+   {
+      PrintFormat("REC_TP: Disabled or not needed (UseRecTP=%d, level=%d, recLoss=%.2f)",
+                  InpUseRecoveryTP, g_martLevel, g_recoveryLoss);
+      return 0;
+   }
+   
+   // Calculate target money to recover
+   double recoveryTargetMoney = g_recoveryLoss * InpRecoveryFactor + InpRecoveryBufferMoney;
+   
+   // Get tick value and tick size for money-to-points conversion
+   double tickValue = SymbolInfoDouble(tradeSym, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(tradeSym, SYMBOL_TRADE_TICK_SIZE);
+   double pointValue = SymbolInfoDouble(tradeSym, SYMBOL_POINT);
+   
+   if(tickValue <= 0 || tickSize <= 0 || lot <= 0)
+   {
+      PrintFormat("REC_TP: Invalid values (tickValue=%.5f, tickSize=%.5f, lot=%.2f)",
+                  tickValue, tickSize, lot);
+      return 0;
+   }
+   
+   // Calculate money per point
+   // moneyPerPoint = tickValue / tickSize * pointValue * lot
+   double moneyPerPoint = (tickValue / tickSize) * pointValue * lot;
+   
+   if(moneyPerPoint <= 0)
+   {
+      PrintFormat("REC_TP: Invalid moneyPerPoint=%.5f", moneyPerPoint);
+      return 0;
+   }
+   
+   // Calculate required TP distance in points
+   int tpPoints = (int)MathCeil(recoveryTargetMoney / moneyPerPoint);
+   
+   // Apply min/max constraints
+   tpPoints = MathMax(InpMinTPPoints, MathMin(InpMaxTPPoints, tpPoints));
+   
+   // Calculate TP price
+   double tpPrice;
+   if(isBuy)
+      tpPrice = entryPrice + tpPoints * pointValue;
+   else
+      tpPrice = entryPrice - tpPoints * pointValue;
+   
+   tpPrice = NormalizeDouble(tpPrice, _Digits);
+   
+   // Log recovery TP calculation
+   PrintFormat("REC_TP: level=%d lot=%.2f recLoss=%.2f target=%.2f moneyPerPt=%.4f tpPts=%d tpPrice=%.5f",
+               g_martLevel, lot, g_recoveryLoss, recoveryTargetMoney, moneyPerPoint, tpPoints, tpPrice);
+   
+   return tpPrice;
+}
+
+//+------------------------------------------------------------------+
+//| Get current setup signature for Same Setup Only check              |
+//+------------------------------------------------------------------+
+string GetSetupSignature()
+{
+   // Create signature from: direction + bias + zone type
+   string direction = (g_sweepType == SWEEP_BULLISH) ? "BULL" : "BEAR";
+   string bias = EnumToString(g_bias);
+   string zone = EnumToString(g_zoneType);
+   
+   string signature = direction + "_" + bias + "_" + zone;
+   return signature;
+}
+
+//+------------------------------------------------------------------+
+//| Check if current setup matches last losing setup                    |
+//| Returns true if martingale should continue, false if should reset   |
+//+------------------------------------------------------------------+
+bool CheckSameSetup()
+{
+   // If Same Setup Only is disabled, always allow
+   if(!InpMartSameSetupOnly)
+      return true;
+   
+   // If martLevel is 0, no need to check
+   if(g_martLevel == 0)
+      return true;
+   
+   // If no previous signature, allow (first loss)
+   if(g_lastSetupSignature == "")
+      return true;
+   
+   // Check bars since last loss
+   int currentBar = iBarShift(tradeSym, InpEntryTF, TimeCurrent());
+   int barsSinceLoss = g_lastLossBarIndex - currentBar;  // Note: bar index decreases over time
+   if(barsSinceLoss < 0) barsSinceLoss = -barsSinceLoss;
+   
+   if(barsSinceLoss > InpMartMaxBarsSinceLoss)
+   {
+      PrintFormat("SAME_SETUP: Bars since loss (%d) > max (%d) - %s martLevel",
+                  barsSinceLoss, InpMartMaxBarsSinceLoss,
+                  InpMartResetIfSetupChanged ? "RESET" : "KEEP");
+      
+      if(InpMartResetIfSetupChanged)
+      {
+         g_martLevel = 0;
+         g_recoveryLoss = 0;
+         g_lastSetupSignature = "";
+         // Save to GlobalVariable
+         if(g_martLevelKey != "") GlobalVariableSet(g_martLevelKey, g_martLevel);
+         if(g_recoveryLossKey != "") GlobalVariableSet(g_recoveryLossKey, g_recoveryLoss);
+      }
+      return false;
+   }
+   
+   // Check signature match
+   string currentSignature = GetSetupSignature();
+   bool match = (currentSignature == g_lastSetupSignature);
+   
+   PrintFormat("SAME_SETUP: current=%s last=%s match=%d barsSinceLoss=%d",
+               currentSignature, g_lastSetupSignature, match, barsSinceLoss);
+   
+   if(!match && InpMartResetIfSetupChanged)
+   {
+      PrintFormat("SAME_SETUP: Signature mismatch - RESET martLevel from %d to 0", g_martLevel);
+      g_martLevel = 0;
+      g_recoveryLoss = 0;
+      g_lastSetupSignature = "";
+      // Save to GlobalVariable
+      if(g_martLevelKey != "") GlobalVariableSet(g_martLevelKey, g_martLevel);
+      if(g_recoveryLossKey != "") GlobalVariableSet(g_recoveryLossKey, g_recoveryLoss);
+      return false;
+   }
+   
+   return match;
+}
+
 //=== TRADE MODE (STRICT/RELAX) ===
 //+------------------------------------------------------------------+
 //| Update trade mode based on time and trades                         |
@@ -3048,21 +3273,44 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
    // Store previous level for logging
    int prevMartLevel = g_martLevel;
    
-   // Update martingale level
+   // Store previous recoveryLoss for logging
+   double prevRecoveryLoss = g_recoveryLoss;
+   
+   // Update martingale level and recovery loss
    if(profitNet > 0)
    {
-      // Win: reset to level 0
-      g_martLevel = 0;
-      g_consecLosses = 0;
-      g_currentLot = InpBaseLot;
-      PrintFormat("MART_DEBUG: WIN - reset level to 0");
+      // Win: check if we recovered enough
+      if(profitNet >= g_recoveryLoss)
+      {
+         // Fully recovered: reset everything
+         PrintFormat("MART_DEBUG: WIN - profit=%.2f >= recoveryLoss=%.2f - FULL RECOVERY", profitNet, g_recoveryLoss);
+         g_martLevel = 0;
+         g_recoveryLoss = 0;
+         g_consecLosses = 0;
+         g_currentLot = InpBaseLot;
+         g_lastSetupSignature = "";
+      }
+      else
+      {
+         // Partial recovery: reduce recoveryLoss but keep martLevel
+         g_recoveryLoss -= profitNet;
+         PrintFormat("MART_DEBUG: WIN - profit=%.2f < recoveryLoss=%.2f - PARTIAL RECOVERY, remaining=%.2f", 
+                     profitNet, prevRecoveryLoss, g_recoveryLoss);
+         // Keep martLevel for next trade to continue recovery
+      }
    }
    else if(profitNet < 0)
    {
-      // Loss: increment level (capped)
+      // Loss: accumulate recovery loss and increment level
+      g_recoveryLoss += MathAbs(profitNet);
       g_consecLosses++;
-      PrintFormat("MART_DEBUG: LOSS - MartMode=%d level=%d maxLevel=%d",
-                  InpMartingaleMode, g_martLevel, InpMartMaxLevel);
+      
+      // Store loss time and bar index for Same Setup Only check
+      g_lastLossTime = TimeCurrent();
+      g_lastLossBarIndex = iBarShift(tradeSym, InpEntryTF, TimeCurrent());
+      
+      PrintFormat("MART_DEBUG: LOSS - MartMode=%d level=%d maxLevel=%d recoveryLoss=%.2f",
+                  InpMartingaleMode, g_martLevel, InpMartMaxLevel, g_recoveryLoss);
       
       if(InpMartingaleMode == MART_AFTER_LOSS && g_martLevel < InpMartMaxLevel)
       {
@@ -3085,6 +3333,13 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
    {
       GlobalVariableSet(g_martLevelKey, g_martLevel);
       PrintFormat("MART_PERSIST: Saved martLevel=%d to GlobalVariable (after deal close)", g_martLevel);
+   }
+   
+   // Persist recoveryLoss
+   if(g_recoveryLossKey != "")
+   {
+      GlobalVariableSet(g_recoveryLossKey, g_recoveryLoss);
+      PrintFormat("MART_PERSIST: Saved recoveryLoss=%.2f to GlobalVariable (after deal close)", g_recoveryLoss);
    }
    
    // Calculate what next lot will be
@@ -4113,7 +4368,7 @@ void UpdatePanel()
    ObjectSetInteger(0, bgName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
    
    // Create labels
-   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v3.0", textColor);
+   CreateLabel(panelName + "0", x, y, "SMC Scalp Bot v3.1", textColor);
    
    // Trade Mode display with color (Tiered RELAX)
    string modeStr;
