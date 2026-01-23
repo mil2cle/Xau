@@ -1,13 +1,13 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v3.4.1                       |
+//|                    SMC Scalping Bot v3.4.2                       |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + Strategy Change B: TP2 + Partial Close at TP1|
-//|                    + Fix: SL hits only count actual losses       |
+//|                    + Trailing Stop with ATR-based distance       |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v3.4.1"
+#property copyright "SMC Scalping Bot v3.4.2"
 #property link      ""
-#property version   "3.41"
+#property version   "3.42"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -161,6 +161,19 @@ input double   InpMoveSLToLockR      = 0.0;           // Lock R multiple (0=use 
 input int      InpTP1TriggerBufferPoints = 1;         // TP1 trigger buffer (allow slightly before/after)
 input double   InpMinPartialLots     = 0.01;          // Min partial close lots
 input double   InpPartialClosePercent = 50.0;         // Partial close % at TP1/1R (legacy)
+
+input group "=== Trailing Stop ==="
+input bool     InpUseTrailingStop        = true;      // Enable trailing stop
+input bool     InpTrailOnlyAfterTP1Partial = true;    // Trail only after TP1 partial closed
+input double   InpTrailStartR             = 0.6;      // Start trailing at this R multiple
+input bool     InpTrailUseATR             = true;     // Use ATR for trail distance
+input int      InpTrailATRPeriod          = 14;       // ATR period for trailing
+input double   InpTrailATRMult            = 0.8;      // ATR multiplier for trail distance
+input int      InpTrailMinDistancePoints  = 150;      // Min trailing distance (points)
+input int      InpTrailMaxDistancePoints  = 1200;     // Max trailing distance (points)
+input int      InpTrailStepPoints         = 20;       // Min improvement to modify SL (points)
+input int      InpTrailCooldownSec        = 30;       // Cooldown between trail modifications (sec)
+input int      InpTrailBEOffsetPoints     = 5;        // Min lock-in above/below BE (points)
 
 input group "=== Risk Guardrails ==="
 input int      InpCooldownBars      = 3;              // Cooldown bars after close
@@ -471,6 +484,35 @@ int            g_totalManualClose = 0;
 // Track if TP1 partial is disabled for current position (TP1 too close)
 bool           g_tp1PartialDisabled = false;    // Set in PlaceOrder if tp1Pts < InpMinTP1Points
 
+// Trailing Stop tracking (per position)
+double         g_entryPrice = 0;                 // Entry price for current position
+int            g_initialRiskPoints = 0;          // Initial risk (abs(entry-sl)/_Point) at entry
+datetime       g_lastTrailModifyTime = 0;        // Last time trailing modified SL
+
+// Trailing Stop Diagnostic Counters (Daily)
+int            g_trailAttemptedCount = 0;
+int            g_trailMovedCount = 0;
+int            g_trailSkippedCooldown = 0;
+int            g_trailSkippedStep = 0;
+int            g_trailSkippedNotAfterPartial = 0;
+int            g_trailSkippedNotReachedR = 0;
+int            g_trailSkippedStopsLevel = 0;
+int            g_trailFailedCount = 0;
+
+// Trailing Stop Diagnostic Counters (All Time)
+int            g_totalTrailAttempted = 0;
+int            g_totalTrailMoved = 0;
+int            g_totalTrailSkippedCooldown = 0;
+int            g_totalTrailSkippedStep = 0;
+int            g_totalTrailSkippedNotAfterPartial = 0;
+int            g_totalTrailSkippedNotReachedR = 0;
+int            g_totalTrailSkippedStopsLevel = 0;
+int            g_totalTrailFailed = 0;
+
+// Trailing skip log throttle
+datetime       g_lastTrailSkipLogTime = 0;
+string         g_lastTrailSkipReason = "";
+
 // Note: RELAX mode parameters are now controlled via input parameters
 // InpRelaxSweepBreakPoints, InpRelaxRollingLiqBars, InpRelax2SweepBreakPoints, etc.
 
@@ -633,9 +675,9 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v3.4.1 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v3.4.2 initialized on ", tradeSym);
    Print("Strategy Change B: TP at TP2, Partial close at TP1, BE move after TP1");
-   Print("Fix: SL hits only count actual losses (BE stops excluded from guardrail)");
+   Print("Trailing Stop: StartR=", InpTrailStartR, " ATR=", InpTrailUseATR, " Cooldown=", InpTrailCooldownSec, "s");
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -713,7 +755,7 @@ void OnDeinit(const int reason)
       PrintFormat("MART_PERSIST: Saved recoveryLoss=%.2f to GlobalVariable key=%s", g_recoveryLoss, g_recoveryLossKey);
    }
    
-   Print("SMC Scalping Bot v3.4.1 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v3.4.2 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -2059,6 +2101,11 @@ void PlaceOrder()
       g_tp1Done = false;
       g_tp1PositionId = g_currentTicket;
       
+      // Store initial risk for trailing stop calculation
+      g_initialRiskPoints = (int)MathRound(MathAbs(price - sl) / _Point);
+      g_lastTrailModifyTime = 0;  // Reset trailing cooldown for new position
+      PrintFormat("TRAIL_INIT: entryPrice=%.5f sl=%.5f initialRiskPts=%d", price, sl, g_initialRiskPoints);
+      
       Print("Order placed: ", EnumToString(orderType), " Lot: ", g_currentLot, 
             " Entry: ", price, " SL: ", sl, " TP(TP2): ", tp, " TP1: ", g_tp1Price, " Mode: ", EnumToString(g_tradeMode));
       
@@ -2572,6 +2619,187 @@ void ManageTrade()
          }
       }
    }
+   
+   // === TRAILING STOP ===
+   // Apply trailing stop after TP1 partial close (if enabled)
+   ApplyTrailingStop();
+}
+
+//+------------------------------------------------------------------+
+//| Apply trailing stop to open position                                |
+//+------------------------------------------------------------------+
+void ApplyTrailingStop()
+{
+   // Check if trailing is enabled
+   if(!InpUseTrailingStop)
+      return;
+   
+   // Check if position exists
+   if(!PositionSelect(tradeSym))
+      return;
+   
+   // Get position info
+   double posOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double posSL = PositionGetDouble(POSITION_SL);
+   double posTP = PositionGetDouble(POSITION_TP);
+   long posType = PositionGetInteger(POSITION_TYPE);
+   long posMagic = PositionGetInteger(POSITION_MAGIC);
+   
+   // Check magic number
+   if(posMagic != InpMagic)
+      return;
+   
+   g_trailAttemptedCount++;
+   
+   // Check if trailing should only work after TP1 partial
+   if(InpTrailOnlyAfterTP1Partial && !g_tp1Done)
+   {
+      g_trailSkippedNotAfterPartial++;
+      LogTrailSkip("not_after_partial");
+      return;
+   }
+   
+   // Get current price
+   double currentBid = SymbolInfoDouble(tradeSym, SYMBOL_BID);
+   double currentAsk = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
+   double currentPrice = (posType == POSITION_TYPE_BUY) ? currentBid : currentAsk;
+   
+   // Calculate profit in R using INITIAL risk (not current SL)
+   if(g_initialRiskPoints <= 0)
+   {
+      // Fallback: use current SL if initial risk not set
+      g_initialRiskPoints = (int)MathRound(MathAbs(g_entryPrice - posSL) / _Point);
+      if(g_initialRiskPoints <= 0)
+         return;
+   }
+   
+   double profitPoints = (posType == POSITION_TYPE_BUY) ?
+                         (currentPrice - g_entryPrice) / _Point :
+                         (g_entryPrice - currentPrice) / _Point;
+   double profitR = profitPoints / g_initialRiskPoints;
+   
+   // Check if profit reached trailing start threshold
+   if(profitR < InpTrailStartR)
+   {
+      g_trailSkippedNotReachedR++;
+      LogTrailSkip("not_reached_R");
+      return;
+   }
+   
+   // Check cooldown
+   if(TimeCurrent() - g_lastTrailModifyTime < InpTrailCooldownSec)
+   {
+      g_trailSkippedCooldown++;
+      LogTrailSkip("cooldown");
+      return;
+   }
+   
+   // Calculate trailing distance
+   double distPts;
+   if(InpTrailUseATR)
+   {
+      // Use ATR for dynamic trailing distance
+      double atr = iATR(tradeSym, InpEntryTF, InpTrailATRPeriod);
+      if(atr > 0)
+      {
+         // Get ATR value
+         double atrBuffer[];
+         ArraySetAsSeries(atrBuffer, true);
+         if(CopyBuffer(iATR(tradeSym, InpEntryTF, InpTrailATRPeriod), 0, 0, 1, atrBuffer) > 0)
+            distPts = (atrBuffer[0] / _Point) * InpTrailATRMult;
+         else
+            distPts = InpTrailMinDistancePoints;  // Fallback
+      }
+      else
+      {
+         distPts = InpTrailMinDistancePoints;  // Fallback
+      }
+   }
+   else
+   {
+      // Use fixed distance based on initial risk
+      distPts = g_initialRiskPoints * InpTrailATRMult;
+   }
+   
+   // Clamp distance to min/max
+   distPts = MathMax(InpTrailMinDistancePoints, MathMin(InpTrailMaxDistancePoints, distPts));
+   
+   // Calculate new SL
+   double newSL;
+   if(posType == POSITION_TYPE_BUY)
+      newSL = currentBid - distPts * _Point;
+   else
+      newSL = currentAsk + distPts * _Point;
+   
+   // Enforce minimum lock-in above/below BE
+   double minLockSL;
+   if(posType == POSITION_TYPE_BUY)
+   {
+      minLockSL = g_entryPrice + InpTrailBEOffsetPoints * _Point;
+      if(newSL < minLockSL)
+         newSL = minLockSL;
+   }
+   else
+   {
+      minLockSL = g_entryPrice - InpTrailBEOffsetPoints * _Point;
+      if(newSL > minLockSL)
+         newSL = minLockSL;
+   }
+   
+   newSL = NormalizeDouble(newSL, _Digits);
+   
+   // Check if improvement is significant (step check)
+   bool significantImprovement = false;
+   if(posType == POSITION_TYPE_BUY)
+      significantImprovement = (newSL > posSL + InpTrailStepPoints * _Point);
+   else
+      significantImprovement = (newSL < posSL - InpTrailStepPoints * _Point);
+   
+   if(!significantImprovement)
+   {
+      g_trailSkippedStep++;
+      LogTrailSkip("step");
+      return;
+   }
+   
+   // Check broker constraints (SYMBOL_TRADE_STOPS_LEVEL + SYMBOL_TRADE_FREEZE_LEVEL)
+   if(!CanModifyStopLevel(currentPrice, newSL, posType))
+   {
+      g_trailSkippedStopsLevel++;
+      LogTrailSkip("stops_level");
+      return;
+   }
+   
+   // Modify position
+   if(trade.PositionModify(tradeSym, newSL, posTP))
+   {
+      g_trailMovedCount++;
+      g_lastTrailModifyTime = TimeCurrent();
+      
+      string typeStr = (posType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      PrintFormat("[TRAIL] type=%s profitR=%.2f distPts=%.0f oldSL=%.5f newSL=%.5f reason=trail",
+                  typeStr, profitR, distPts, posSL, newSL);
+   }
+   else
+   {
+      g_trailFailedCount++;
+      PrintFormat("[TRAIL_FAIL] err=%d oldSL=%.5f newSL=%.5f", GetLastError(), posSL, newSL);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Log trailing skip reason (throttled)                               |
+//+------------------------------------------------------------------+
+void LogTrailSkip(string reason)
+{
+   // Throttle: only log same reason once per 60 seconds
+   if(reason == g_lastTrailSkipReason && TimeCurrent() - g_lastTrailSkipLogTime < 60)
+      return;
+   
+   g_lastTrailSkipReason = reason;
+   g_lastTrailSkipLogTime = TimeCurrent();
+   
+   PrintFormat("[TRAIL_SKIP] reason=%s", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -4266,6 +4494,16 @@ void ResetDailyCounters()
       g_totalBeStops += g_beStopCount;
       g_totalTpHits += g_tpHitsCount;
       g_totalManualClose += g_manualCloseCount;
+      
+      // Add trailing stop counters to totals
+      g_totalTrailAttempted += g_trailAttemptedCount;
+      g_totalTrailMoved += g_trailMovedCount;
+      g_totalTrailSkippedCooldown += g_trailSkippedCooldown;
+      g_totalTrailSkippedStep += g_trailSkippedStep;
+      g_totalTrailSkippedNotAfterPartial += g_trailSkippedNotAfterPartial;
+      g_totalTrailSkippedNotReachedR += g_trailSkippedNotReachedR;
+      g_totalTrailSkippedStopsLevel += g_trailSkippedStopsLevel;
+      g_totalTrailFailed += g_trailFailedCount;
    }
    
    g_tradesToday = 0;
@@ -4314,6 +4552,16 @@ void ResetDailyCounters()
    g_tpHitsCount = 0;
    g_manualCloseCount = 0;
    
+   // Reset trailing stop counters
+   g_trailAttemptedCount = 0;
+   g_trailMovedCount = 0;
+   g_trailSkippedCooldown = 0;
+   g_trailSkippedStep = 0;
+   g_trailSkippedNotAfterPartial = 0;
+   g_trailSkippedNotReachedR = 0;
+   g_trailSkippedStopsLevel = 0;
+   g_trailFailedCount = 0;
+   
    Print("=== DAILY RESET ===");
    Print("Start equity: ", g_dailyStartEquity);
    Print("Trade mode reset to STRICT");
@@ -4342,6 +4590,43 @@ void PrintDailySummary()
    Print("  PartialTP1_failed: ", g_tp1PartialFailedCount, " (last reason: ", g_lastTP1FailReason, ")");
    Print("  PartialTP1_skipped: ", g_tp1PartialSkippedCount, " (TP1 too close)");
    Print("  BE_move_count: ", g_beMovedCount);
+   
+   // Trailing Stop diagnostics
+   Print("--- Trailing Stop (Today) ---");
+   Print("  Trail: attempted=", g_trailAttemptedCount, " moved=", g_trailMovedCount, " failed=", g_trailFailedCount);
+   
+   // Top trail skip reasons
+   int trailSkipCounts[6];
+   string trailSkipNames[6];
+   trailSkipCounts[0] = g_trailSkippedCooldown;     trailSkipNames[0] = "cooldown";
+   trailSkipCounts[1] = g_trailSkippedStep;         trailSkipNames[1] = "step";
+   trailSkipCounts[2] = g_trailSkippedNotAfterPartial; trailSkipNames[2] = "not_after_partial";
+   trailSkipCounts[3] = g_trailSkippedNotReachedR;  trailSkipNames[3] = "not_reached_R";
+   trailSkipCounts[4] = g_trailSkippedStopsLevel;   trailSkipNames[4] = "stops_level";
+   trailSkipCounts[5] = 0;                          trailSkipNames[5] = "";
+   
+   // Sort and print top 3
+   for(int i = 0; i < 5; i++)
+   {
+      for(int j = i + 1; j < 5; j++)
+      {
+         if(trailSkipCounts[j] > trailSkipCounts[i])
+         {
+            int tmpCnt = trailSkipCounts[i];
+            string tmpName = trailSkipNames[i];
+            trailSkipCounts[i] = trailSkipCounts[j];
+            trailSkipNames[i] = trailSkipNames[j];
+            trailSkipCounts[j] = tmpCnt;
+            trailSkipNames[j] = tmpName;
+         }
+      }
+   }
+   string skipLine = "  Top skip: ";
+   for(int i = 0; i < 3 && trailSkipCounts[i] > 0; i++)
+   {
+      skipLine += trailSkipNames[i] + "=" + IntegerToString(trailSkipCounts[i]) + " ";
+   }
+   Print(skipLine);
    
    // Print microchoch diagnostics by mode
    Print("--- Microchoch Diagnostics (Today) ---");
@@ -4482,6 +4767,53 @@ void PrintFinalSummary()
       double successRate = (double)finalTP1Triggered / (finalTP1Triggered + finalTP1Failed) * 100;
       Print("  Success rate: ", DoubleToString(successRate, 1), "%");
    }
+   Print("");
+   
+   // Trailing Stop diagnostics (All Time)
+   int finalTrailAttempted = g_totalTrailAttempted + g_trailAttemptedCount;
+   int finalTrailMoved = g_totalTrailMoved + g_trailMovedCount;
+   int finalTrailFailed = g_totalTrailFailed + g_trailFailedCount;
+   Print("--- Trailing Stop (All Time) ---");
+   Print("  trail_attempted: ", finalTrailAttempted);
+   Print("  trail_moved: ", finalTrailMoved);
+   Print("  trail_failed: ", finalTrailFailed);
+   
+   // Top trail skip reasons (all time)
+   int finalSkipCounts[5];
+   string finalSkipNames[5];
+   finalSkipCounts[0] = g_totalTrailSkippedCooldown + g_trailSkippedCooldown;
+   finalSkipNames[0] = "cooldown";
+   finalSkipCounts[1] = g_totalTrailSkippedStep + g_trailSkippedStep;
+   finalSkipNames[1] = "step";
+   finalSkipCounts[2] = g_totalTrailSkippedNotAfterPartial + g_trailSkippedNotAfterPartial;
+   finalSkipNames[2] = "not_after_partial";
+   finalSkipCounts[3] = g_totalTrailSkippedNotReachedR + g_trailSkippedNotReachedR;
+   finalSkipNames[3] = "not_reached_R";
+   finalSkipCounts[4] = g_totalTrailSkippedStopsLevel + g_trailSkippedStopsLevel;
+   finalSkipNames[4] = "stops_level";
+   
+   // Sort and print top 3
+   for(int i = 0; i < 4; i++)
+   {
+      for(int j = i + 1; j < 5; j++)
+      {
+         if(finalSkipCounts[j] > finalSkipCounts[i])
+         {
+            int tmpCnt = finalSkipCounts[i];
+            string tmpName = finalSkipNames[i];
+            finalSkipCounts[i] = finalSkipCounts[j];
+            finalSkipNames[i] = finalSkipNames[j];
+            finalSkipCounts[j] = tmpCnt;
+            finalSkipNames[j] = tmpName;
+         }
+      }
+   }
+   string skipLineAll = "  Top skip reasons: ";
+   for(int i = 0; i < 3 && finalSkipCounts[i] > 0; i++)
+   {
+      skipLineAll += finalSkipNames[i] + "=" + IntegerToString(finalSkipCounts[i]) + " ";
+   }
+   Print(skipLineAll);
    Print("");
    
    // Print mode time distribution
