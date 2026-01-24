@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v3.6                         |
+//|                    SMC Scalping Bot v3.7                         |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + Trailing + Auto Tune + SL_LOSS Guardrail    |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v3.6"
+#property copyright "SMC Scalping Bot v3.7"
 #property link      ""
-#property version   "3.60"
+#property version   "3.70"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -121,10 +121,19 @@ enum ENUM_TRAIL_MODE
 enum ENUM_EXIT_CLASS
 {
    EXIT_NONE,
-   EXIT_SL_LOSS,             // SL hit with actual loss (profit < 0)
-   EXIT_BE_OR_TRAIL,         // SL hit but profit >= 0 (BE or trailed)
+   EXIT_SL_LOSS,             // SL hit with actual loss (profit < -eps)
+   EXIT_BE_STOP,             // SL hit but profit >= -eps (BE stop)
+   EXIT_TRAIL_STOP,          // SL hit from trailing with profit > 0
    EXIT_TP,                  // Take profit hit
    EXIT_MANUAL               // Manual close or other
+};
+
+// SL Source tracking - to classify exit correctly
+enum ENUM_SL_SOURCE
+{
+   SL_SRC_INITIAL,           // Original SL from entry
+   SL_SRC_BE,                // SL moved to BE
+   SL_SRC_TRAIL              // SL moved by trailing
 };
 
 //=== INPUT PARAMETERS ===
@@ -164,30 +173,17 @@ input group "=== SL/TP Parameters ==="
 input int      InpSLBufferPoints    = 40;             // SL buffer min (points)
 input double   InpPartialClosePercent = 50.0;         // Partial close % at TP1/1R
 
-input group "=== Trailing Stop ==="
-input bool     InpEnableTrailing     = true;          // Enable trailing stop
-input double   InpTrailStartR        = 0.6;           // Start trailing at this R profit (0.6 = 60% of risk)
-input bool     InpTrailAfterTP1Only  = true;          // Trail only after TP1 partial success
-input double   InpTrailATRMult       = 1.2;           // ATR multiplier for trail distance
-input int      InpTrailMinStepPoints = 30;            // Min improvement to modify SL (points)
+input group "=== 2-Stage BE + Trailing Stop ==="
+input bool     InpEnableTrailing     = true;          // Enable trailing stop system
+input double   InpBEStartR           = 0.6;           // Stage A: Move SL to BE at this R profit
+input int      InpBEOffsetPoints     = 25;            // BE offset for spread/commission (points)
+input double   InpTrailStartR        = 1.0;           // Stage B: Start ATR trailing at this R profit
+input int      InpTrailATRPeriod     = 14;            // ATR period for trailing
+input double   InpTrailATRMult       = 1.8;           // ATR multiplier for trail distance
+input int      InpTrailMinStepPoints = 25;            // Min improvement to modify SL (points)
 input int      InpTrailCooldownSec   = 30;            // Cooldown between SL modifications (sec)
-input double   InpTrailLockMinR      = 0.1;           // Min lock-in R after trail starts (0.1 = 10%)
-input bool     InpTrailUseSwingTrail = false;         // Use swing high/low for trailing
-input int      InpTrailSwingLookback = 2;             // Swing lookback for trailing
-
-input group "=== Auto Tune Entry Filters ==="
-input bool     InpAutoTuneEntryFilters = true;        // Auto-tune entry filters based on cancel stats
-input int      InpNoSweepBreakReducePct = 20;          // Reduce SweepBreakPoints by this % when no_sweep high
-input int      InpChochMaxBarsIncrease = 4;            // Increase ChochMaxBars by this when choch_timeout high
-input int      InpAutoTuneMinCancels = 200;            // Min cancels before auto-tune kicks in
-input double   InpAutoTuneNoSweepThreshold = 0.45;     // Trigger if no_sweep/total > this (45%)
-input double   InpAutoTuneChochThreshold = 0.20;       // Trigger if choch_timeout/total > this (20%)
-
-input group "=== Smart BE (Lock Profit) ==="
-input bool     InpUseSmartBE         = true;          // Enable smart BE
-input double   InpBEStartR           = 0.4;           // Move SL to BE at this R profit
-input double   InpBELockR            = 0.05;          // Lock this R profit (0.05 = 5% of risk)
-input int      InpBEOffsetPoints     = 25;            // Extra offset for spread/slippage
+input bool     InpTrailUseTP1Gate    = true;          // Trail requires TP1 partial OR BEStartR reached
+input double   InpBEProfitEpsMoney   = 0.50;          // Profit threshold for BE_STOP classification ($)
 
 input group "=== Risk Guardrails ==="
 input int      InpCooldownBars      = 3;              // Cooldown bars after close
@@ -489,6 +485,14 @@ bool           g_tp1PartialDone = false;     // TP1 partial close completed
 
 // === SMART BE TRACKING ===
 bool           g_smartBEDone = false;        // Smart BE already applied
+bool           g_beStageDone = false;        // BE stage completed (R >= BEStartR)
+
+// === SL SOURCE TRACKING ===
+ENUM_SL_SOURCE g_lastSLSource = SL_SRC_INITIAL;  // Current SL source
+double         g_lastModifiedSL = 0;             // Last modified SL price
+datetime       g_lastSLModifyTime = 0;           // Last SL modify timestamp
+double         g_entryPrice = 0;                 // Entry price for R calculation
+double         g_initialSL = 0;                  // Initial SL for R calculation
 
 // === MFE/MAE TRACKING (per trade) ===
 double         g_mfePoints = 0;              // Max Favorable Excursion (points)
@@ -499,22 +503,28 @@ datetime       g_tradeEntryTime = 0;         // Trade entry time
 double         g_maxProfitR = 0;             // Max profit R reached
 
 // === EXIT CLASSIFICATION COUNTERS (daily) ===
-int            g_slLossHitsToday = 0;        // SL with actual loss (profit < 0)
-int            g_beOrTrailStopsToday = 0;    // SL but profit >= 0
+int            g_slLossHitsToday = 0;        // SL with actual loss (profit < -eps)
+int            g_beStopHitsToday = 0;        // SL hit but profit >= -eps (BE stop)
+int            g_trailStopHitsToday = 0;     // SL hit from trailing with profit > 0
 int            g_tpHitsToday = 0;            // TP hits
 int            g_trailMoveCountToday = 0;    // Trail SL modifications
 int            g_beMoveCountToday = 0;       // BE SL modifications
+double         g_beStopProfitSum = 0;        // Sum of profits from BE stops
 double         g_trailStopProfitSum = 0;     // Sum of profits from trail stops
 double         g_slLossProfitSum = 0;        // Sum of losses from SL loss
+int            g_tp1PartialSkippedMinVol = 0; // TP1 partial skipped due to min volume
 
 // === EXIT CLASSIFICATION COUNTERS (all time) ===
 int            g_totalSlLossHits = 0;
-int            g_totalBeOrTrailStops = 0;
+int            g_totalBeStopHits = 0;
+int            g_totalTrailStopHits = 0;
 int            g_totalTpHits = 0;
 int            g_totalTrailMoveCount = 0;
 int            g_totalBeMoveCount = 0;
+double         g_totalBeStopProfitSum = 0;
 double         g_totalTrailStopProfitSum = 0;
 double         g_totalSlLossProfitSum = 0;
+int            g_totalTp1PartialSkippedMinVol = 0;
 
 // === TRAILING DIAGNOSTIC COUNTERS ===
 int            g_trailAttemptedToday = 0;    // Trail attempts
@@ -718,7 +728,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalp EA v3.6 initialized on ", tradeSym);
+   Print("SMC Scalp EA v3.7 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -2595,10 +2605,11 @@ double GetFurtherLiquidity(bool isLong)
 //=== TRADE MANAGEMENT ===
 
 //+------------------------------------------------------------------+
-//| Apply Trailing Stop (Spec v3.6)                                     |
-//| - ATR-based trailing with LockMinR                                  |
-//| - Optional swing trail                                              |
-//| - Respects broker constraints                                       |
+//| Stage B: ATR Trailing (Spec v3.7)                                    |
+//| - Start trailing when R >= InpTrailStartR                            |
+//| - Gate: requires TP1 partial OR BE stage done (if InpTrailUseTP1Gate)|
+//| - candidateSL = price - ATR*mult - spread buffer                     |
+//| - Tighten only, min step, cooldown, broker constraints               |
 //+------------------------------------------------------------------+
 void ApplyTrailingStop()
 {
@@ -2608,9 +2619,12 @@ void ApplyTrailingStop()
    if(!PositionSelect(tradeSym))
       return;
    
-   // Check if TP1 partial is required first
-   if(InpTrailAfterTP1Only && !g_tp1PartialDone)
-      return;
+   // Gate check: if InpTrailUseTP1Gate, must have TP1 partial done OR BE stage done
+   if(InpTrailUseTP1Gate)
+   {
+      if(!g_tp1PartialDone && !g_beStageDone)
+         return;  // Neither gate passed yet
+   }
    
    double posOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
    double posSL = PositionGetDouble(POSITION_SL);
@@ -2622,20 +2636,29 @@ void ApplyTrailingStop()
    double currentPrice = (posType == POSITION_TYPE_BUY) ? currentBid : currentAsk;
    
    // Calculate profit in R using initial risk
-   if(g_initialRiskPoints <= 0)
-      return;
+   double riskPoints = g_initialRiskPoints;
+   if(riskPoints <= 0)
+   {
+      // Fallback: calculate from current position
+      riskPoints = MathAbs(posOpenPrice - g_initialSL) / _Point;
+      if(riskPoints <= 0)
+         riskPoints = MathAbs(posOpenPrice - posSL) / _Point;
+      if(riskPoints <= 0)
+         return;
+   }
    
    double profitPoints = (posType == POSITION_TYPE_BUY) ?
                          (currentBid - posOpenPrice) / _Point :
                          (posOpenPrice - currentAsk) / _Point;
-   double profitR = profitPoints / g_initialRiskPoints;
+   double profitR = profitPoints / riskPoints;
    
    // Check if profit reached trail start threshold
    if(profitR < InpTrailStartR)
       return;
    
    // Check cooldown
-   if(TimeCurrent() - g_lastTrailModifyTime < InpTrailCooldownSec)
+   datetime now = TimeCurrent();
+   if((now - g_lastTrailModifyTime) < InpTrailCooldownSec)
    {
       g_trailSkipCooldown++;
       g_lastTrailSkipReason = "cooldown";
@@ -2645,78 +2668,41 @@ void ApplyTrailingStop()
    g_trailAttemptedToday++;
    
    // Get broker constraints
-   double spreadBuffer = GetSpreadPoints() * _Point;
+   double spreadPoints = GetSpreadPoints();
+   double spreadBuffer = spreadPoints * _Point;
    int stopsLevel = (int)SymbolInfoInteger(tradeSym, SYMBOL_TRADE_STOPS_LEVEL);
-   double minStopDistance = MathMax(stopsLevel * _Point, spreadBuffer);
+   int freezeLevel = (int)SymbolInfoInteger(tradeSym, SYMBOL_TRADE_FREEZE_LEVEL);
+   double minStopDistance = MathMax(MathMax(stopsLevel, freezeLevel) * _Point, spreadBuffer);
    
    // Calculate ATR-based trailing distance
-   double atrBuffer[];
-   ArraySetAsSeries(atrBuffer, true);
-   int atrHandle = iATR(tradeSym, InpBiasTF, 14);  // Use bias TF for ATR
+   double atrValue = 0;
+   int atrHandle = iATR(tradeSym, InpEntryTF, InpTrailATRPeriod);
    double trailDistance = 250 * _Point;  // Default fallback
    
-   if(atrHandle != INVALID_HANDLE && CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) > 0)
+   if(atrHandle != INVALID_HANDLE)
    {
-      trailDistance = atrBuffer[0] * InpTrailATRMult;
+      double atrBuffer[];
+      ArraySetAsSeries(atrBuffer, true);
+      if(CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) > 0)
+      {
+         atrValue = atrBuffer[0];
+         trailDistance = atrValue * InpTrailATRMult;
+      }
+      IndicatorRelease(atrHandle);
    }
    
    // Ensure minimum distance
    trailDistance = MathMax(trailDistance, minStopDistance);
    
-   // Calculate candidate SL from ATR trail
+   // Calculate candidate SL: price - ATR*mult - spread buffer
    double candidateSL;
    if(posType == POSITION_TYPE_BUY)
    {
-      candidateSL = currentBid - trailDistance;
+      candidateSL = currentBid - trailDistance - spreadBuffer;
    }
    else
    {
-      candidateSL = currentAsk + trailDistance;
-   }
-   
-   // Apply LockMinR constraint - SL must lock at least InpTrailLockMinR profit
-   double lockMinSL;
-   if(posType == POSITION_TYPE_BUY)
-   {
-      lockMinSL = posOpenPrice + InpTrailLockMinR * g_initialRiskPoints * _Point;
-      candidateSL = MathMax(candidateSL, lockMinSL);
-   }
-   else
-   {
-      lockMinSL = posOpenPrice - InpTrailLockMinR * g_initialRiskPoints * _Point;
-      candidateSL = MathMin(candidateSL, lockMinSL);
-   }
-   
-   // Optional: Use swing trail if enabled
-   if(InpTrailUseSwingTrail)
-   {
-      double swingCandidate = 0;
-      if(posType == POSITION_TYPE_BUY)
-      {
-         // Find recent swing low
-         double lowBuffer[];
-         ArraySetAsSeries(lowBuffer, true);
-         if(CopyLow(tradeSym, InpEntryTF, 0, InpTrailSwingLookback + 2, lowBuffer) > 0)
-         {
-            swingCandidate = lowBuffer[ArrayMinimum(lowBuffer, 0, InpTrailSwingLookback + 2)] - spreadBuffer;
-            // Use tighter of ATR or swing (but still respect LockMinR)
-            if(swingCandidate > candidateSL)
-               candidateSL = swingCandidate;
-         }
-      }
-      else
-      {
-         // Find recent swing high
-         double highBuffer[];
-         ArraySetAsSeries(highBuffer, true);
-         if(CopyHigh(tradeSym, InpEntryTF, 0, InpTrailSwingLookback + 2, highBuffer) > 0)
-         {
-            swingCandidate = highBuffer[ArrayMaximum(highBuffer, 0, InpTrailSwingLookback + 2)] + spreadBuffer;
-            // Use tighter of ATR or swing (but still respect LockMinR)
-            if(swingCandidate < candidateSL)
-               candidateSL = swingCandidate;
-         }
-      }
+      candidateSL = currentAsk + trailDistance + spreadBuffer;
    }
    
    double newSL = NormalizeDouble(candidateSL, _Digits);
@@ -2725,12 +2711,12 @@ void ApplyTrailingStop()
    if(posType == POSITION_TYPE_BUY)
    {
       if(newSL <= posSL)
-         return;
+         return;  // Not an improvement
    }
    else
    {
       if(newSL >= posSL)
-         return;
+         return;  // Not an improvement
    }
    
    // Check minimum step improvement
@@ -2756,13 +2742,15 @@ void ApplyTrailingStop()
    if(trade.PositionModify(tradeSym, newSL, posTP))
    {
       g_trailMoveCountToday++;
-      g_lastTrailModifyTime = TimeCurrent();
+      g_lastTrailModifyTime = now;
       g_trailingActive = true;
+      g_lastSLSource = SL_SRC_TRAIL;
+      g_lastModifiedSL = newSL;
+      g_lastSLModifyTime = now;
       
       string typeStr = (posType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
-      double atrPts = (atrHandle != INVALID_HANDLE && ArraySize(atrBuffer) > 0) ? atrBuffer[0]/_Point : 0;
-      PrintFormat("[TRAIL] floatingR=%.2f oldSL=%.5f newSL=%.5f atrPts=%.0f reason=trail",
-                  profitR, posSL, newSL, atrPts);
+      PrintFormat("[TRAIL] R=%.2f ATR=%.0f oldSL=%.5f newSL=%.5f source=TRAIL result=move",
+                  profitR, atrValue/_Point, posSL, newSL);
    }
    else
    {
@@ -2771,14 +2759,17 @@ void ApplyTrailingStop()
 }
 
 //+------------------------------------------------------------------+
-//| Apply Smart BE (Lock Profit)                                        |
+//| Stage A: BE Move (Spec v3.7)                                         |
+//| - Move SL to BE when profit >= InpBEStartR                           |
+//| - newSL = entry + (spread + InpBEOffsetPoints) * Point               |
+//| - Tighten only, respect broker constraints                           |
 //+------------------------------------------------------------------+
 void ApplySmartBE()
 {
-   if(!InpUseSmartBE)
+   if(!InpEnableTrailing)  // BE is part of trailing system
       return;
    
-   if(g_smartBEDone)
+   if(g_beStageDone)  // Already done BE stage
       return;
    
    if(!PositionSelect(tradeSym))
@@ -2793,36 +2784,47 @@ void ApplySmartBE()
    double currentAsk = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
    
    // Calculate profit in R using initial risk
-   if(g_initialRiskPoints <= 0)
-      return;
+   double riskPoints = g_initialRiskPoints;
+   if(riskPoints <= 0)
+   {
+      // Fallback: calculate from current position
+      riskPoints = MathAbs(posOpenPrice - posSL) / _Point;
+      if(riskPoints <= 0)
+         return;
+   }
    
    double profitPoints = (posType == POSITION_TYPE_BUY) ?
                          (currentBid - posOpenPrice) / _Point :
                          (posOpenPrice - currentAsk) / _Point;
-   double profitR = profitPoints / g_initialRiskPoints;
+   double profitR = profitPoints / riskPoints;
    
    // Check if profit reached BE start threshold
    if(profitR < InpBEStartR)
       return;
    
-   // Calculate new SL
+   // Calculate new SL: entry + (spread + offset) * Point
    double spreadPoints = GetSpreadPoints();
-   double lockOffset = (InpBELockR * g_initialRiskPoints + InpBEOffsetPoints) * _Point;
    double newSL;
    
    if(posType == POSITION_TYPE_BUY)
    {
-      newSL = posOpenPrice + lockOffset;
-      // Only move if improvement
+      newSL = posOpenPrice + (spreadPoints + InpBEOffsetPoints) * _Point;
+      // Tighten only: newSL must be better (higher) than current SL
       if(newSL <= posSL)
+      {
+         PrintFormat("[BE_SKIP] reason=no_improvement newSL=%.5f <= oldSL=%.5f", newSL, posSL);
          return;
+      }
    }
    else
    {
-      newSL = posOpenPrice - lockOffset;
-      // Only move if improvement
+      newSL = posOpenPrice - (spreadPoints + InpBEOffsetPoints) * _Point;
+      // Tighten only: newSL must be better (lower) than current SL
       if(newSL >= posSL)
+      {
+         PrintFormat("[BE_SKIP] reason=no_improvement newSL=%.5f >= oldSL=%.5f", newSL, posSL);
          return;
+      }
    }
    
    newSL = NormalizeDouble(newSL, _Digits);
@@ -2830,7 +2832,8 @@ void ApplySmartBE()
    // Check broker constraints
    double currentPrice = (posType == POSITION_TYPE_BUY) ? currentBid : currentAsk;
    int stopsLevel = (int)SymbolInfoInteger(tradeSym, SYMBOL_TRADE_STOPS_LEVEL);
-   double minStopDistance = stopsLevel * _Point;
+   int freezeLevel = (int)SymbolInfoInteger(tradeSym, SYMBOL_TRADE_FREEZE_LEVEL);
+   double minStopDistance = MathMax(stopsLevel, freezeLevel) * _Point;
    double distanceToSL = MathAbs(currentPrice - newSL);
    
    if(distanceToSL < minStopDistance)
@@ -2842,12 +2845,16 @@ void ApplySmartBE()
    // Modify position (keep TP unchanged)
    if(trade.PositionModify(tradeSym, newSL, posTP))
    {
+      g_beStageDone = true;
       g_smartBEDone = true;
       g_beMoveCountToday++;
+      g_lastSLSource = SL_SRC_BE;
+      g_lastModifiedSL = newSL;
+      g_lastSLModifyTime = TimeCurrent();
       
       string typeStr = (posType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
-      PrintFormat("[SMART_BE] type=%s profitR=%.2f oldSL=%.5f newSL=%.5f lockR=%.2f offset=%d",
-                  typeStr, profitR, posSL, newSL, InpBELockR, InpBEOffsetPoints);
+      PrintFormat("[BE_MOVE] type=%s R=%.2f oldSL=%.5f newSL=%.5f source=BE reason=R>=%.1f",
+                  typeStr, profitR, posSL, newSL, InpBEStartR);
    }
    else
    {
@@ -2962,28 +2969,42 @@ void ManageTrade()
       
       if(atTP1 || at1R)
       {
-         // Partial close
-         double closeVolume = NormalizeDouble(posVolume * InpPartialClosePercent / 100.0, 2);
-         if(closeVolume >= 0.01)
+         // Partial close with proper volume normalization
+         double rawCloseVolume = posVolume * InpPartialClosePercent / 100.0;
+         double closeVolume = NormalizeVolumeToStep(rawCloseVolume);
+         double minVolume = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MIN);
+         
+         if(closeVolume < minVolume)
          {
-            if(trade.PositionClosePartial(tradeSym, closeVolume))
+            // Skip partial close - volume too small
+            g_tp1PartialSkippedMinVol++;
+            PrintFormat("[TP1_PARTIAL_SKIP] reason=min_vol closeVol=%.2f minVol=%.2f", closeVolume, minVolume);
+         }
+         else if(trade.PositionClosePartial(tradeSym, closeVolume))
+         {
+            g_partialClosed = true;
+            g_tp1PartialDone = true;  // Mark TP1 partial as done for trailing
+            
+            // Move SL to BE + spread + offset
+            double spreadPoints = GetSpreadPoints();
+            double newSL;
+            
+            if(posType == POSITION_TYPE_BUY)
+               newSL = posOpenPrice + (spreadPoints + InpBEOffsetPoints) * _Point;
+            else
+               newSL = posOpenPrice - (spreadPoints + InpBEOffsetPoints) * _Point;
+            
+            newSL = NormalizeDouble(newSL, _Digits);
+            
+            if(trade.PositionModify(tradeSym, newSL, g_tp2Price))
             {
-               g_partialClosed = true;
-               g_tp1PartialDone = true;  // Mark TP1 partial as done for trailing
-               
-               // Move SL to BE + spread
-               double spreadPoints = GetSpreadPoints();
-               double newSL;
-               
-               if(posType == POSITION_TYPE_BUY)
-                  newSL = posOpenPrice + spreadPoints * _Point;
-               else
-                  newSL = posOpenPrice - spreadPoints * _Point;
-               
-               trade.PositionModify(tradeSym, newSL, g_tp2Price);
-               
-               PrintFormat("[TP1_PARTIAL] closeVol=%.2f newSL=%.5f newTP=%.5f", closeVolume, newSL, g_tp2Price);
+               g_lastSLSource = SL_SRC_BE;
+               g_lastModifiedSL = newSL;
+               g_lastSLModifyTime = TimeCurrent();
+               g_beStageDone = true;  // TP1 partial also counts as BE stage
             }
+            
+            PrintFormat("[TP1_PARTIAL] closeVol=%.2f newSL=%.5f newTP=%.5f source=BE", closeVolume, newSL, g_tp2Price);
          }
       }
    }
@@ -3986,14 +4007,17 @@ void DailyResetIfNeeded()
    
    if(currentDayKey != g_dayKeyYYYYMMDD)
    {
-      // Accumulate today's counters to totals before reset
+      // Accumulate today's counters to totals before reset (Spec v3.7)
       g_totalSlLossHits += g_slLossHitsToday;
-      g_totalBeOrTrailStops += g_beOrTrailStopsToday;
+      g_totalBeStopHits += g_beStopHitsToday;
+      g_totalTrailStopHits += g_trailStopHitsToday;
       g_totalTpHits += g_tpHitsToday;
       g_totalTrailMoveCount += g_trailMoveCountToday;
       g_totalBeMoveCount += g_beMoveCountToday;
+      g_totalBeStopProfitSum += g_beStopProfitSum;
       g_totalTrailStopProfitSum += g_trailStopProfitSum;
       g_totalSlLossProfitSum += g_slLossProfitSum;
+      g_totalTp1PartialSkippedMinVol += g_tp1PartialSkippedMinVol;
       
       // Accumulate bottleneck stats
       g_totalNoSweepCount += g_noSweepCount;
@@ -4010,14 +4034,25 @@ void DailyResetIfNeeded()
       g_blockedToday = false;
       ArrayResize(g_countedPositionIds, 0);
       
-      // Reset exit classification counters
+      // Reset exit classification counters (Spec v3.7)
       g_slLossHitsToday = 0;
-      g_beOrTrailStopsToday = 0;
+      g_beStopHitsToday = 0;
+      g_trailStopHitsToday = 0;
       g_tpHitsToday = 0;
       g_trailMoveCountToday = 0;
       g_beMoveCountToday = 0;
+      g_beStopProfitSum = 0;
       g_trailStopProfitSum = 0;
       g_slLossProfitSum = 0;
+      g_tp1PartialSkippedMinVol = 0;
+      
+      // Reset SL source tracking
+      g_lastSLSource = SL_SRC_INITIAL;
+      g_lastModifiedSL = 0;
+      g_lastSLModifyTime = 0;
+      g_beStageDone = false;
+      g_smartBEDone = false;
+      g_trailingActive = false;
       
       // Reset trailing diagnostic counters
       g_trailAttemptedToday = 0;
@@ -4100,7 +4135,11 @@ void AutoTuneEntryFilters()
 }
 
 //+------------------------------------------------------------------+
-//| Check deal for SL hit                                              |
+//| Check deal for SL hit and classify exit (Spec v3.7)                 |
+//| - SL_LOSS: profit < -InpBEProfitEpsMoney (actual loss)              |
+//| - BE_STOP: profit >= -InpBEProfitEpsMoney (breakeven or small loss) |
+//| - TRAIL_STOP: g_lastSLSource == SL_SRC_TRAIL && profit > 0          |
+//| - Only SL_LOSS counts toward guardrail                              |
 //+------------------------------------------------------------------+
 void CheckDealForSLHit(ulong dealTicket)
 {
@@ -4131,47 +4170,106 @@ void CheckDealForSLHit(ulong dealTicket)
    if(dealMagic != InpMagic)
       return;
    
-   // Check if reason is SL
+   // Get deal details
    ENUM_DEAL_REASON dealReason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
-   if(dealReason != DEAL_REASON_SL)
-      return;
-   
-   // Get position ID for deduplication
    ulong positionId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-   
-   // Check if already counted (prevent partial fill double counting)
-   if(IsPositionIdCounted(positionId))
-      return;
-   
    double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
    double dealCommission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
    double dealSwap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
    double profitNet = dealProfit + dealCommission + dealSwap;
    double dealVolume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+   double dealPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
    
-   // Only count as SL hit if actual loss (profit < 0)
-   // BE stops and Trail stops (profit >= 0) should NOT count toward guardrail
-   if(profitNet >= 0)
-   {
-      Print("[SL_CHECK] BE/Trail stop detected (profit=", DoubleToString(profitNet, 2), ") - NOT counting toward SL guardrail");
+   // Check if already counted (prevent partial fill double counting)
+   if(IsPositionIdCounted(positionId))
       return;
-   }
    
-   // Count this SL hit (actual loss only)
-   AddCountedPositionId(positionId);
-   g_slHitsToday++;
+   // Classify exit type
+   ENUM_EXIT_CLASS exitClass = EXIT_NONE;
+   string exitReason = "";
    
-   Print("=== SL_LOSS COUNTED (Guardrail) ===");
-   Print("Deal: ", dealTicket, " | Position: ", positionId);
-   Print("Volume: ", dealVolume, " | Net Profit: ", DoubleToString(profitNet, 2));
-   Print("SL_LOSS Hits Today: ", g_slHitsToday, "/", InpMaxSLHitsPerDay);
-   
-   // Check if max SL hits reached
-   if(g_slHitsToday >= InpMaxSLHitsPerDay && InpStopTradingOnSLHits)
+   if(dealReason == DEAL_REASON_TP)
    {
-      g_blockedToday = true;
-      Print("=== DAILY STOP TRIGGERED ===");
-      Print("Max SL_LOSS hits (", InpMaxSLHitsPerDay, ") reached. Trading blocked for today.");
+      // TP hit
+      exitClass = EXIT_TP;
+      exitReason = "TP";
+      g_tpHitsToday++;
+      AddCountedPositionId(positionId);
+      
+      PrintFormat("[EXIT] classify=TP profit=%.2f deal=%I64u pos=%I64u", profitNet, dealTicket, positionId);
+   }
+   else if(dealReason == DEAL_REASON_SL)
+   {
+      // SL hit - classify based on profit and SL source
+      AddCountedPositionId(positionId);
+      
+      if(profitNet >= -InpBEProfitEpsMoney)
+      {
+         // Profit >= -eps: classify as BE_STOP
+         exitClass = EXIT_BE_STOP;
+         exitReason = "BE_STOP";
+         g_beStopHitsToday++;
+         g_beStopProfitSum += profitNet;
+         
+         PrintFormat("[EXIT] classify=BE_STOP profit=%.2f slSource=%s deal=%I64u pos=%I64u",
+                     profitNet, GetSLSourceName(g_lastSLSource), dealTicket, positionId);
+      }
+      else if(g_lastSLSource == SL_SRC_TRAIL && profitNet > 0)
+      {
+         // Trailing SL with profit > 0: classify as TRAIL_STOP
+         exitClass = EXIT_TRAIL_STOP;
+         exitReason = "TRAIL_STOP";
+         g_trailStopHitsToday++;
+         g_trailStopProfitSum += profitNet;
+         
+         PrintFormat("[EXIT] classify=TRAIL_STOP profit=%.2f slSource=TRAIL deal=%I64u pos=%I64u",
+                     profitNet, dealTicket, positionId);
+      }
+      else
+      {
+         // Actual loss: classify as SL_LOSS and count toward guardrail
+         exitClass = EXIT_SL_LOSS;
+         exitReason = "SL_LOSS";
+         g_slLossHitsToday++;
+         g_slLossProfitSum += profitNet;
+         g_slHitsToday++;  // Legacy counter for guardrail
+         
+         PrintFormat("[EXIT] classify=SL_LOSS profit=%.2f slSource=%s deal=%I64u pos=%I64u",
+                     profitNet, GetSLSourceName(g_lastSLSource), dealTicket, positionId);
+         PrintFormat("SL_LOSS Hits Today: %d/%d", g_slHitsToday, InpMaxSLHitsPerDay);
+         
+         // Check if max SL hits reached
+         if(g_slHitsToday >= InpMaxSLHitsPerDay && InpStopTradingOnSLHits)
+         {
+            g_blockedToday = true;
+            Print("=== DAILY STOP TRIGGERED ===");
+            PrintFormat("Max SL_LOSS hits (%d) reached. Trading blocked for today.", InpMaxSLHitsPerDay);
+         }
+      }
+   }
+   else
+   {
+      // Other reason (manual close, etc.)
+      exitClass = EXIT_MANUAL;
+      exitReason = "MANUAL";
+      AddCountedPositionId(positionId);
+      
+      PrintFormat("[EXIT] classify=MANUAL reason=%d profit=%.2f deal=%I64u pos=%I64u",
+                  dealReason, profitNet, dealTicket, positionId);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get SL source name for logging                                      |
+//+------------------------------------------------------------------+
+string GetSLSourceName(ENUM_SL_SOURCE source)
+{
+   switch(source)
+   {
+      case SL_SRC_INITIAL: return "INITIAL";
+      case SL_SRC_BE:      return "BE";
+      case SL_SRC_TRAIL:   return "TRAIL";
+      default:             return "UNKNOWN";
    }
 }
 
@@ -4352,34 +4450,31 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
       Print("MART_DEBUG: BREAKEVEN - level unchanged");
    }
    
-   // === EXIT CLASSIFICATION ===
+   // === EXIT CLASSIFICATION (Spec v3.7) ===
+   // Note: Main classification is done in CheckDealForSLHit()
+   // This is a secondary log for MFE/MAE tracking
    ENUM_EXIT_CLASS exitClass = EXIT_MANUAL;
    ENUM_DEAL_REASON dealReason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
    
    if(dealReason == DEAL_REASON_TP)
    {
       exitClass = EXIT_TP;
-      g_tpHitsToday++;
    }
    else if(dealReason == DEAL_REASON_SL)
    {
-      // Classify based on profit: SL_LOSS if profit < 0, BE_OR_TRAIL if profit >= 0
-      if(profitNet < 0)
+      // Classify based on profit and SL source
+      if(profitNet >= -InpBEProfitEpsMoney)
       {
-         exitClass = EXIT_SL_LOSS;
-         g_slLossHitsToday++;
-         g_slLossProfitSum += profitNet;
+         exitClass = EXIT_BE_STOP;
+      }
+      else if(g_lastSLSource == SL_SRC_TRAIL && profitNet > 0)
+      {
+         exitClass = EXIT_TRAIL_STOP;
       }
       else
       {
-         exitClass = EXIT_BE_OR_TRAIL;
-         g_beOrTrailStopsToday++;
-         g_trailStopProfitSum += profitNet;
+         exitClass = EXIT_SL_LOSS;
       }
-   }
-   else
-   {
-      exitClass = EXIT_MANUAL;
    }
    
    // Log with MFE/MAE
@@ -4398,7 +4493,11 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
    g_trailingActive = false;
    g_tp1PartialDone = false;
    g_smartBEDone = false;
+   g_beStageDone = false;
    g_initialRiskPoints = 0;
+   g_lastSLSource = SL_SRC_INITIAL;
+   g_lastModifiedSL = 0;
+   g_lastSLModifyTime = 0;
    
    // === FINAL CLOSE LOG ===
    PrintFormat("CLOSE: posId=%I64u net=%.2f martLevel=%d->%d recLoss=%.2f->%.2f exit=%s",
@@ -4681,6 +4780,32 @@ double GetSpreadPoints()
 }
 
 //+------------------------------------------------------------------+
+//| Normalize volume to broker's step (Spec v3.7)                       |
+//| - Uses SYMBOL_VOLUME_STEP and SYMBOL_VOLUME_MIN                     |
+//| - Floors to step to avoid rejection                                 |
+//+------------------------------------------------------------------+
+double NormalizeVolumeToStep(double volume)
+{
+   double volumeStep = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_STEP);
+   double volumeMin = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MIN);
+   double volumeMax = SymbolInfoDouble(tradeSym, SYMBOL_VOLUME_MAX);
+   
+   // Floor to step
+   if(volumeStep > 0)
+      volume = MathFloor(volume / volumeStep) * volumeStep;
+   
+   // Clamp to min/max
+   volume = MathMax(volume, volumeMin);
+   volume = MathMin(volume, volumeMax);
+   
+   // Round to avoid floating point issues
+   int digits = (int)MathCeil(-MathLog10(volumeStep));
+   volume = NormalizeDouble(volume, digits);
+   
+   return volume;
+}
+
+//+------------------------------------------------------------------+
 //| Update spread history for spike detection                          |
 //+------------------------------------------------------------------+
 void UpdateSpreadHistory(double spreadPoints)
@@ -4902,12 +5027,13 @@ void PrintDailySummary()
    Print("Trades executed: ", g_tradesToday);
    Print("Daily PnL: ", DoubleToString(g_dailyPnL, 2));
    
-   // Exit Classification (Today)
+   // Exit Classification (Today) - Spec v3.7
    Print("--- Exit Classification (Today) ---");
    Print("  SL_LOSS hits: ", g_slLossHitsToday, " (loss sum: ", DoubleToString(g_slLossProfitSum, 2), ")");
-   Print("  BE/Trail stops: ", g_beOrTrailStopsToday, " (profit sum: ", DoubleToString(g_trailStopProfitSum, 2), ")");
+   Print("  BE_STOP hits: ", g_beStopHitsToday, " (profit sum: ", DoubleToString(g_beStopProfitSum, 2), ")");
+   Print("  TRAIL_STOP hits: ", g_trailStopHitsToday, " (profit sum: ", DoubleToString(g_trailStopProfitSum, 2), ")");
    Print("  TP hits: ", g_tpHitsToday);
-   Print("  Legacy SL Hits: ", g_slHitsToday, "/", InpMaxSLHitsPerDay);
+   Print("  Guardrail SL Hits: ", g_slHitsToday, "/", InpMaxSLHitsPerDay, " (only SL_LOSS counts)");
    
    // Trailing/BE diagnostics (Today)
    Print("--- Trailing/BE (Today) ---");
@@ -5030,25 +5156,30 @@ void PrintFinalSummary()
    Print("Policy: ", InpUseTargetFirstPolicy ? "TARGET-FIRST" : "TIME-BASED");
    Print("");
    
-   // Exit Classification (All Time)
+   // Exit Classification (All Time) - Spec v3.7
    int finalSlLossHits = g_totalSlLossHits + g_slLossHitsToday;
-   int finalBeOrTrailStops = g_totalBeOrTrailStops + g_beOrTrailStopsToday;
+   int finalBeStopHits = g_totalBeStopHits + g_beStopHitsToday;
+   int finalTrailStopHits = g_totalTrailStopHits + g_trailStopHitsToday;
    int finalTpHits = g_totalTpHits + g_tpHitsToday;
    int finalTrailMoves = g_totalTrailMoveCount + g_trailMoveCountToday;
    int finalBeMoves = g_totalBeMoveCount + g_beMoveCountToday;
-   double finalTrailProfit = g_totalTrailStopProfitSum + g_trailStopProfitSum;
    double finalSlLossSum = g_totalSlLossProfitSum + g_slLossProfitSum;
+   double finalBeStopProfit = g_totalBeStopProfitSum + g_beStopProfitSum;
+   double finalTrailStopProfit = g_totalTrailStopProfitSum + g_trailStopProfitSum;
    
    Print("--- Exit Classification (All Time) ---");
    Print("  SL_LOSS hits: ", finalSlLossHits, " (loss sum: ", DoubleToString(finalSlLossSum, 2), ")");
-   Print("  BE/Trail stops: ", finalBeOrTrailStops, " (profit sum: ", DoubleToString(finalTrailProfit, 2), ")");
+   Print("  BE_STOP hits: ", finalBeStopHits, " (profit sum: ", DoubleToString(finalBeStopProfit, 2), ")");
+   Print("  TRAIL_STOP hits: ", finalTrailStopHits, " (profit sum: ", DoubleToString(finalTrailStopProfit, 2), ")");
    Print("  TP hits: ", finalTpHits);
    Print("");
    
    // Trailing/BE diagnostics (All Time)
    Print("--- Trailing/BE (All Time) ---");
-   Print("  Trail moves: ", finalTrailMoves);
    Print("  BE moves: ", finalBeMoves);
+   Print("  Trail moves: ", finalTrailMoves);
+   Print("  Trail attempted: ", g_trailAttemptedToday);  // Note: daily counter only
+   Print("  Trail skips (cooldown/min_step/broker): ", g_trailSkipCooldown, "/", g_trailSkipMinStep, "/", g_trailSkipBroker);
    Print("");
    
    // Print mode time distribution
