@@ -1,13 +1,13 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v3.4.2                       |
+//|                    SMC Scalping Bot v3.4.3                       |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + Strategy Change B: TP2 + Partial Close at TP1|
-//|                    + Trailing Stop with ATR-based distance       |
+//|                    + Trailing Stop + Exit Classification         |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v3.4.2"
+#property copyright "SMC Scalping Bot v3.4.3"
 #property link      ""
-#property version   "3.42"
+#property version   "3.43"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -163,17 +163,19 @@ input double   InpMinPartialLots     = 0.01;          // Min partial close lots
 input double   InpPartialClosePercent = 50.0;         // Partial close % at TP1/1R (legacy)
 
 input group "=== Trailing Stop ==="
-input bool     InpUseTrailingStop        = true;      // Enable trailing stop
-input bool     InpTrailOnlyAfterTP1Partial = true;    // Trail only after TP1 partial closed
-input double   InpTrailStartR             = 0.6;      // Start trailing at this R multiple
-input bool     InpTrailUseATR             = true;     // Use ATR for trail distance
+input bool     InpUseTrailing            = true;      // Enable trailing stop
+
+enum TRAIL_START_MODE { TRAIL_AFTER_TP1, TRAIL_AFTER_R };
+input TRAIL_START_MODE InpTrailStartMode = TRAIL_AFTER_TP1;  // When to start trailing
+
+input double   InpTrailStartR             = 1.0;      // Start trailing at this R (for TRAIL_AFTER_R)
 input int      InpTrailATRPeriod          = 14;       // ATR period for trailing
-input double   InpTrailATRMult            = 0.8;      // ATR multiplier for trail distance
-input int      InpTrailMinDistancePoints  = 150;      // Min trailing distance (points)
-input int      InpTrailMaxDistancePoints  = 1200;     // Max trailing distance (points)
+input double   InpTrailATRMult            = 1.2;      // ATR multiplier for trail distance
+input int      InpTrailMinPoints          = 120;      // Min trailing distance (points) - prevent easy stops
 input int      InpTrailStepPoints         = 20;       // Min improvement to modify SL (points)
 input int      InpTrailCooldownSec        = 30;       // Cooldown between trail modifications (sec)
-input int      InpTrailBEOffsetPoints     = 5;        // Min lock-in above/below BE (points)
+input int      InpTrailLockMinAfterTP1Points = 25;    // Min lock-in above BE after TP1 (points)
+input bool     InpTrailUpdateOnNewBarOnly = true;     // Update trail only on new bar (reduce noise)
 
 input group "=== Risk Guardrails ==="
 input int      InpCooldownBars      = 3;              // Cooldown bars after close
@@ -470,14 +472,16 @@ int            g_totalBEMoved = 0;              // All time
 string         g_lastTP1FailReason = "";        // Last failure reason
 
 // Exit Classification Counters (Daily)
-int            g_slLossHitsCount = 0;           // SL hits with actual loss (profit < 0)
-int            g_beStopCount = 0;               // SL hits but profit >= 0 (BE stop)
+int            g_slLossHitsCount = 0;           // SL hits with actual loss (profit < -eps)
+int            g_beStopCount = 0;               // SL hits but profit ~= 0 (BE stop, |profit| <= eps)
+int            g_trailStopCount = 0;            // SL hits but profit > eps (trail/lock profit)
 int            g_tpHitsCount = 0;               // TP hits
 int            g_manualCloseCount = 0;          // Manual/other close
 
 // Exit Classification Counters (All Time)
 int            g_totalSlLossHits = 0;
 int            g_totalBeStops = 0;
+int            g_totalTrailStops = 0;
 int            g_totalTpHits = 0;
 int            g_totalManualClose = 0;
 
@@ -492,22 +496,27 @@ datetime       g_lastTrailModifyTime = 0;        // Last time trailing modified 
 // Trailing Stop Diagnostic Counters (Daily)
 int            g_trailAttemptedCount = 0;
 int            g_trailMovedCount = 0;
+int            g_trailRejectCount = 0;          // Rejected due to stops/freeze constraints
 int            g_trailSkippedCooldown = 0;
 int            g_trailSkippedStep = 0;
 int            g_trailSkippedNotAfterPartial = 0;
 int            g_trailSkippedNotReachedR = 0;
-int            g_trailSkippedStopsLevel = 0;
+int            g_trailSkippedNewBar = 0;        // Skipped due to not new bar
 int            g_trailFailedCount = 0;
 
 // Trailing Stop Diagnostic Counters (All Time)
 int            g_totalTrailAttempted = 0;
 int            g_totalTrailMoved = 0;
+int            g_totalTrailReject = 0;
 int            g_totalTrailSkippedCooldown = 0;
 int            g_totalTrailSkippedStep = 0;
 int            g_totalTrailSkippedNotAfterPartial = 0;
 int            g_totalTrailSkippedNotReachedR = 0;
-int            g_totalTrailSkippedStopsLevel = 0;
+int            g_totalTrailSkippedNewBar = 0;
 int            g_totalTrailFailed = 0;
+
+// New bar tracking for trailing
+datetime       g_lastTrailBarTime = 0;
 
 // Trailing skip log throttle
 datetime       g_lastTrailSkipLogTime = 0;
@@ -675,9 +684,9 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalping Bot v3.4.2 initialized on ", tradeSym);
+   Print("SMC Scalping Bot v3.4.3 initialized on ", tradeSym);
    Print("Strategy Change B: TP at TP2, Partial close at TP1, BE move after TP1");
-   Print("Trailing Stop: StartR=", InpTrailStartR, " ATR=", InpTrailUseATR, " Cooldown=", InpTrailCooldownSec, "s");
+   Print("Trailing: Mode=", EnumToString(InpTrailStartMode), " ATRmult=", InpTrailATRMult, " MinPts=", InpTrailMinPoints, " Cooldown=", InpTrailCooldownSec, "s");
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -755,7 +764,7 @@ void OnDeinit(const int reason)
       PrintFormat("MART_PERSIST: Saved recoveryLoss=%.2f to GlobalVariable key=%s", g_recoveryLoss, g_recoveryLossKey);
    }
    
-   Print("SMC Scalping Bot v3.4.2 deinitialized. Reason: ", reason);
+   Print("SMC Scalping Bot v3.4.3 deinitialized. Reason: ", reason);
 }
 
 //+------------------------------------------------------------------+
@@ -2631,7 +2640,7 @@ void ManageTrade()
 void ApplyTrailingStop()
 {
    // Check if trailing is enabled
-   if(!InpUseTrailingStop)
+   if(!InpUseTrailing)
       return;
    
    // Check if position exists
@@ -2651,39 +2660,52 @@ void ApplyTrailingStop()
    
    g_trailAttemptedCount++;
    
-   // Check if trailing should only work after TP1 partial
-   if(InpTrailOnlyAfterTP1Partial && !g_tp1Done)
+   // Check trailing start condition based on mode
+   if(InpTrailStartMode == TRAIL_AFTER_TP1)
    {
-      g_trailSkippedNotAfterPartial++;
-      LogTrailSkip("not_after_partial");
-      return;
-   }
-   
-   // Get current price
-   double currentBid = SymbolInfoDouble(tradeSym, SYMBOL_BID);
-   double currentAsk = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
-   double currentPrice = (posType == POSITION_TYPE_BUY) ? currentBid : currentAsk;
-   
-   // Calculate profit in R using INITIAL risk (not current SL)
-   if(g_initialRiskPoints <= 0)
-   {
-      // Fallback: use current SL if initial risk not set
-      g_initialRiskPoints = (int)MathRound(MathAbs(g_entryPrice - posSL) / _Point);
-      if(g_initialRiskPoints <= 0)
+      // Only trail after TP1 partial close
+      if(!g_tp1Done)
+      {
+         g_trailSkippedNotAfterPartial++;
+         LogTrailSkip("not_after_partial");
          return;
+      }
+   }
+   else  // TRAIL_AFTER_R
+   {
+      // Calculate profit in R using INITIAL risk (not current SL)
+      if(g_initialRiskPoints <= 0)
+      {
+         // Fallback: use current SL if initial risk not set
+         g_initialRiskPoints = (int)MathRound(MathAbs(g_entryPrice - posSL) / _Point);
+         if(g_initialRiskPoints <= 0)
+            return;
+      }
+      
+      double currentBidR = SymbolInfoDouble(tradeSym, SYMBOL_BID);
+      double profitPointsR = (posType == POSITION_TYPE_BUY) ?
+                            (currentBidR - g_entryPrice) / _Point :
+                            (g_entryPrice - SymbolInfoDouble(tradeSym, SYMBOL_ASK)) / _Point;
+      double profitR = profitPointsR / g_initialRiskPoints;
+      
+      if(profitR < InpTrailStartR)
+      {
+         g_trailSkippedNotReachedR++;
+         LogTrailSkip("not_reached_R");
+         return;
+      }
    }
    
-   double profitPoints = (posType == POSITION_TYPE_BUY) ?
-                         (currentPrice - g_entryPrice) / _Point :
-                         (g_entryPrice - currentPrice) / _Point;
-   double profitR = profitPoints / g_initialRiskPoints;
-   
-   // Check if profit reached trailing start threshold
-   if(profitR < InpTrailStartR)
+   // Check new bar only mode
+   if(InpTrailUpdateOnNewBarOnly)
    {
-      g_trailSkippedNotReachedR++;
-      LogTrailSkip("not_reached_R");
-      return;
+      datetime currentBarTime = iTime(tradeSym, InpEntryTF, 0);
+      if(currentBarTime == g_lastTrailBarTime)
+      {
+         g_trailSkippedNewBar++;
+         LogTrailSkip("not_new_bar");
+         return;
+      }
    }
    
    // Check cooldown
@@ -2694,66 +2716,49 @@ void ApplyTrailingStop()
       return;
    }
    
-   // Calculate trailing distance
-   double distPts;
-   if(InpTrailUseATR)
+   // Get current prices
+   double currentBid = SymbolInfoDouble(tradeSym, SYMBOL_BID);
+   double currentAsk = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
+   double spreadPts = GetSpreadPoints();
+   
+   // Calculate trailing distance using ATR
+   double atrBuffer[];
+   ArraySetAsSeries(atrBuffer, true);
+   int atrHandle = iATR(tradeSym, InpEntryTF, InpTrailATRPeriod);
+   double distPts = InpTrailMinPoints;  // Default
+   
+   if(atrHandle != INVALID_HANDLE && CopyBuffer(atrHandle, 0, 0, 1, atrBuffer) > 0)
    {
-      // Use ATR for dynamic trailing distance
-      double atr = iATR(tradeSym, InpEntryTF, InpTrailATRPeriod);
-      if(atr > 0)
-      {
-         // Get ATR value
-         double atrBuffer[];
-         ArraySetAsSeries(atrBuffer, true);
-         if(CopyBuffer(iATR(tradeSym, InpEntryTF, InpTrailATRPeriod), 0, 0, 1, atrBuffer) > 0)
-            distPts = (atrBuffer[0] / _Point) * InpTrailATRMult;
-         else
-            distPts = InpTrailMinDistancePoints;  // Fallback
-      }
-      else
-      {
-         distPts = InpTrailMinDistancePoints;  // Fallback
-      }
-   }
-   else
-   {
-      // Use fixed distance based on initial risk
-      distPts = g_initialRiskPoints * InpTrailATRMult;
+      distPts = MathMax(InpTrailMinPoints, (atrBuffer[0] / _Point) * InpTrailATRMult);
    }
    
-   // Clamp distance to min/max
-   distPts = MathMax(InpTrailMinDistancePoints, MathMin(InpTrailMaxDistancePoints, distPts));
-   
-   // Calculate new SL
-   double newSL;
-   if(posType == POSITION_TYPE_BUY)
-      newSL = currentBid - distPts * _Point;
-   else
-      newSL = currentAsk + distPts * _Point;
-   
-   // Enforce minimum lock-in above/below BE
+   // Calculate candidate SL
+   double candidateSL;
    double minLockSL;
+   
    if(posType == POSITION_TYPE_BUY)
    {
-      minLockSL = g_entryPrice + InpTrailBEOffsetPoints * _Point;
-      if(newSL < minLockSL)
-         newSL = minLockSL;
+      candidateSL = currentBid - distPts * _Point;
+      // Enforce minimum lock-in above BE after TP1
+      minLockSL = g_entryPrice + (spreadPts + InpTrailLockMinAfterTP1Points) * _Point;
+      candidateSL = MathMax(candidateSL, minLockSL);
    }
-   else
+   else  // SELL
    {
-      minLockSL = g_entryPrice - InpTrailBEOffsetPoints * _Point;
-      if(newSL > minLockSL)
-         newSL = minLockSL;
+      candidateSL = currentAsk + distPts * _Point;
+      // Enforce maximum lock-in below BE after TP1
+      minLockSL = g_entryPrice - (spreadPts + InpTrailLockMinAfterTP1Points) * _Point;
+      candidateSL = MathMin(candidateSL, minLockSL);
    }
    
-   newSL = NormalizeDouble(newSL, _Digits);
+   candidateSL = NormalizeDouble(candidateSL, _Digits);
    
-   // Check if improvement is significant (step check)
+   // Check if improvement is significant (step check) - TIGHTEN ONLY
    bool significantImprovement = false;
    if(posType == POSITION_TYPE_BUY)
-      significantImprovement = (newSL > posSL + InpTrailStepPoints * _Point);
+      significantImprovement = (candidateSL > posSL + InpTrailStepPoints * _Point);
    else
-      significantImprovement = (newSL < posSL - InpTrailStepPoints * _Point);
+      significantImprovement = (candidateSL < posSL - InpTrailStepPoints * _Point);
    
    if(!significantImprovement)
    {
@@ -2763,27 +2768,38 @@ void ApplyTrailingStop()
    }
    
    // Check broker constraints (SYMBOL_TRADE_STOPS_LEVEL + SYMBOL_TRADE_FREEZE_LEVEL)
-   if(!CanModifyStopLevel(currentPrice, newSL, posType))
+   double currentPrice = (posType == POSITION_TYPE_BUY) ? currentBid : currentAsk;
+   int stopsLevel = (int)SymbolInfoInteger(tradeSym, SYMBOL_TRADE_STOPS_LEVEL);
+   int freezeLevel = (int)SymbolInfoInteger(tradeSym, SYMBOL_TRADE_FREEZE_LEVEL);
+   double minDistance = MathMax(stopsLevel, freezeLevel) * _Point;
+   double slDistance = MathAbs(currentPrice - candidateSL);
+   
+   if(slDistance < minDistance)
    {
-      g_trailSkippedStopsLevel++;
-      LogTrailSkip("stops_level");
+      g_trailRejectCount++;
+      PrintFormat("[TRAIL_REJECT] reason=stops_freeze slDist=%.0f minDist=%.0f stopsLevel=%d freezeLevel=%d",
+                  slDistance/_Point, minDistance/_Point, stopsLevel, freezeLevel);
       return;
    }
    
    // Modify position
-   if(trade.PositionModify(tradeSym, newSL, posTP))
+   if(trade.PositionModify(tradeSym, candidateSL, posTP))
    {
       g_trailMovedCount++;
       g_lastTrailModifyTime = TimeCurrent();
+      g_lastTrailBarTime = iTime(tradeSym, InpEntryTF, 0);  // Update bar time
       
       string typeStr = (posType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
-      PrintFormat("[TRAIL] type=%s profitR=%.2f distPts=%.0f oldSL=%.5f newSL=%.5f reason=trail",
-                  typeStr, profitR, distPts, posSL, newSL);
+      double profitPts = (posType == POSITION_TYPE_BUY) ?
+                         (currentBid - g_entryPrice) / _Point :
+                         (g_entryPrice - currentAsk) / _Point;
+      PrintFormat("[TRAIL] type=%s profitPts=%.0f distPts=%.0f oldSL=%.5f newSL=%.5f reason=trail",
+                  typeStr, profitPts, distPts, posSL, candidateSL);
    }
    else
    {
       g_trailFailedCount++;
-      PrintFormat("[TRAIL_FAIL] err=%d oldSL=%.5f newSL=%.5f", GetLastError(), posSL, newSL);
+      PrintFormat("[TRAIL_FAIL] err=%d oldSL=%.5f newSL=%.5f", GetLastError(), posSL, candidateSL);
    }
 }
 
@@ -4050,23 +4066,31 @@ void UpdateMartingaleFromDeal(ulong dealTicket)
    }
    
    // === EXIT CLASSIFICATION ===
-   // Classify the exit reason: SL_LOSS, BE_STOP, TP, MANUAL
+   // Classify the exit reason: SL_LOSS, BE_STOP, TRAIL_STOP, TP, MANUAL
    ENUM_DEAL_REASON dealReason = (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
    string exitClass = "MANUAL";
-   double commissionEpsilon = 0.50;  // Allow small negative from commission
+   double eps = 0.50;  // Epsilon for BE classification (allow small commission)
    
    if(dealReason == DEAL_REASON_SL)
    {
-      // SL triggered - check if actual loss or BE stop
-      if(profitNet < -commissionEpsilon)
+      // SL triggered - classify based on profit
+      if(profitNet < -eps)
       {
+         // Actual loss
          exitClass = "SL_LOSS";
          g_slLossHitsCount++;
       }
-      else
+      else if(MathAbs(profitNet) <= eps)
       {
+         // Breakeven (profit ~= 0)
          exitClass = "BE_STOP";
          g_beStopCount++;
+      }
+      else  // profitNet > eps
+      {
+         // Profit from trailing/lock
+         exitClass = "TRAIL_STOP";
+         g_trailStopCount++;
       }
    }
    else if(dealReason == DEAL_REASON_TP)
@@ -4492,17 +4516,19 @@ void ResetDailyCounters()
       // Add exit classification counters to totals
       g_totalSlLossHits += g_slLossHitsCount;
       g_totalBeStops += g_beStopCount;
+      g_totalTrailStops += g_trailStopCount;
       g_totalTpHits += g_tpHitsCount;
       g_totalManualClose += g_manualCloseCount;
       
       // Add trailing stop counters to totals
       g_totalTrailAttempted += g_trailAttemptedCount;
       g_totalTrailMoved += g_trailMovedCount;
+      g_totalTrailReject += g_trailRejectCount;
       g_totalTrailSkippedCooldown += g_trailSkippedCooldown;
       g_totalTrailSkippedStep += g_trailSkippedStep;
       g_totalTrailSkippedNotAfterPartial += g_trailSkippedNotAfterPartial;
       g_totalTrailSkippedNotReachedR += g_trailSkippedNotReachedR;
-      g_totalTrailSkippedStopsLevel += g_trailSkippedStopsLevel;
+      g_totalTrailSkippedNewBar += g_trailSkippedNewBar;
       g_totalTrailFailed += g_trailFailedCount;
    }
    
@@ -4549,17 +4575,19 @@ void ResetDailyCounters()
    // Reset exit classification counters
    g_slLossHitsCount = 0;
    g_beStopCount = 0;
+   g_trailStopCount = 0;
    g_tpHitsCount = 0;
    g_manualCloseCount = 0;
    
    // Reset trailing stop counters
    g_trailAttemptedCount = 0;
    g_trailMovedCount = 0;
+   g_trailRejectCount = 0;
    g_trailSkippedCooldown = 0;
    g_trailSkippedStep = 0;
    g_trailSkippedNotAfterPartial = 0;
    g_trailSkippedNotReachedR = 0;
-   g_trailSkippedStopsLevel = 0;
+   g_trailSkippedNewBar = 0;
    g_trailFailedCount = 0;
    
    Print("=== DAILY RESET ===");
@@ -4579,10 +4607,11 @@ void PrintDailySummary()
    
    // Exit Classification (Today)
    Print("--- Exit Classification (Today) ---");
-   Print("  SL_loss_hits: ", g_slLossHitsCount);
-   Print("  BE_stops: ", g_beStopCount);
-   Print("  TP_hits: ", g_tpHitsCount);
-   Print("  Manual_close: ", g_manualCloseCount);
+   Print("  SL_LOSS hits: ", g_slLossHitsCount, " (guardrail uses this)");
+   Print("  BE stops: ", g_beStopCount);
+   Print("  TRAIL stops: ", g_trailStopCount);
+   Print("  TP hits: ", g_tpHitsCount);
+   Print("  Manual close: ", g_manualCloseCount);
    
    // TP1 Partial Close diagnostics
    Print("--- TP1 Partial Close (Today) ---");
@@ -4593,17 +4622,20 @@ void PrintDailySummary()
    
    // Trailing Stop diagnostics
    Print("--- Trailing Stop (Today) ---");
-   Print("  Trail: attempted=", g_trailAttemptedCount, " moved=", g_trailMovedCount, " failed=", g_trailFailedCount);
+   Print("  Trail moves: ", g_trailMovedCount);
+   Print("  Trail rejects: ", g_trailRejectCount, " (stops/freeze constraints)");
+   Print("  Trail failed: ", g_trailFailedCount);
    
    // Top trail skip reasons
-   int trailSkipCounts[6];
-   string trailSkipNames[6];
+   int trailSkipCounts[7];
+   string trailSkipNames[7];
    trailSkipCounts[0] = g_trailSkippedCooldown;     trailSkipNames[0] = "cooldown";
    trailSkipCounts[1] = g_trailSkippedStep;         trailSkipNames[1] = "step";
    trailSkipCounts[2] = g_trailSkippedNotAfterPartial; trailSkipNames[2] = "not_after_partial";
    trailSkipCounts[3] = g_trailSkippedNotReachedR;  trailSkipNames[3] = "not_reached_R";
-   trailSkipCounts[4] = g_trailSkippedStopsLevel;   trailSkipNames[4] = "stops_level";
+   trailSkipCounts[4] = g_trailSkippedNewBar;       trailSkipNames[4] = "not_new_bar";
    trailSkipCounts[5] = 0;                          trailSkipNames[5] = "";
+   trailSkipCounts[6] = 0;                          trailSkipNames[6] = "";
    
    // Sort and print top 3
    for(int i = 0; i < 5; i++)
@@ -4746,10 +4778,12 @@ void PrintFinalSummary()
    int finalTpHits = g_totalTpHits + g_tpHitsCount;
    int finalManualClose = g_totalManualClose + g_manualCloseCount;
    Print("--- Exit Classification (All Time) ---");
-   Print("  SL_loss_hits: ", finalSlLossHits);
-   Print("  BE_stops: ", finalBeStops);
-   Print("  TP_hits: ", finalTpHits);
-   Print("  Manual_close: ", finalManualClose);
+   int finalTrailStops = g_totalTrailStops + g_trailStopCount;
+   Print("  SL_LOSS hits: ", finalSlLossHits, " (guardrail uses this)");
+   Print("  BE stops: ", finalBeStops);
+   Print("  TRAIL stops: ", finalTrailStops);
+   Print("  TP hits: ", finalTpHits);
+   Print("  Manual close: ", finalManualClose);
    Print("");
    
    // TP1 Partial Close diagnostics (All Time)
@@ -4772,15 +4806,16 @@ void PrintFinalSummary()
    // Trailing Stop diagnostics (All Time)
    int finalTrailAttempted = g_totalTrailAttempted + g_trailAttemptedCount;
    int finalTrailMoved = g_totalTrailMoved + g_trailMovedCount;
+   int finalTrailReject = g_totalTrailReject + g_trailRejectCount;
    int finalTrailFailed = g_totalTrailFailed + g_trailFailedCount;
    Print("--- Trailing Stop (All Time) ---");
-   Print("  trail_attempted: ", finalTrailAttempted);
-   Print("  trail_moved: ", finalTrailMoved);
-   Print("  trail_failed: ", finalTrailFailed);
+   Print("  Trail moves: ", finalTrailMoved);
+   Print("  Trail rejects: ", finalTrailReject, " (stops/freeze constraints)");
+   Print("  Trail failed: ", finalTrailFailed);
    
    // Top trail skip reasons (all time)
-   int finalSkipCounts[5];
-   string finalSkipNames[5];
+   int finalSkipCounts[6];
+   string finalSkipNames[6];
    finalSkipCounts[0] = g_totalTrailSkippedCooldown + g_trailSkippedCooldown;
    finalSkipNames[0] = "cooldown";
    finalSkipCounts[1] = g_totalTrailSkippedStep + g_trailSkippedStep;
@@ -4789,8 +4824,10 @@ void PrintFinalSummary()
    finalSkipNames[2] = "not_after_partial";
    finalSkipCounts[3] = g_totalTrailSkippedNotReachedR + g_trailSkippedNotReachedR;
    finalSkipNames[3] = "not_reached_R";
-   finalSkipCounts[4] = g_totalTrailSkippedStopsLevel + g_trailSkippedStopsLevel;
-   finalSkipNames[4] = "stops_level";
+   finalSkipCounts[4] = g_totalTrailSkippedNewBar + g_trailSkippedNewBar;
+   finalSkipNames[4] = "not_new_bar";
+   finalSkipCounts[5] = 0;
+   finalSkipNames[5] = "";
    
    // Sort and print top 3
    for(int i = 0; i < 4; i++)
