@@ -1,12 +1,12 @@
 //+------------------------------------------------------------------+
 //|                    SMC_Scalp_Martingale_XAUUSD_iux.mq5           |
-//|                    SMC Scalping Bot v3.7                         |
+//|                    SMC Scalping Bot v3.71                        |
 //|                    For DEMO Account Only - XAUUSD variants       |
 //|                    + Trailing + Auto Tune + SL_LOSS Guardrail    |
 //+------------------------------------------------------------------+
-#property copyright "SMC Scalping Bot v3.7"
+#property copyright "SMC Scalping Bot v3.71"
 #property link      ""
-#property version   "3.70"
+#property version   "3.71"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -272,15 +272,19 @@ input group "=== CSV Logging ==="
 input bool     InpEnableCSVLogging  = true;           // Enable daily CSV logging
 input string   InpCSVFolder         = "SMC_Scalp_Logs"; // CSV folder name
 
-input group "=== Martingale ==="
-input ENUM_MARTINGALE_MODE InpMartingaleMode = MART_AFTER_LOSS; // Martingale mode
-input double   InpBaseLot           = 0.01;           // Base lot
-input double   InpMartMultiplier    = 2.0;            // Martingale multiplier
-input int      InpMartMaxLevel      = 3;              // Max martingale level
-input double   InpLotCapMax         = 0.08;           // Max lot cap
+input group "=== Lot Sizing ==="
+input bool     InpUseRiskBasedLot   = true;           // Use risk-based lot sizing (recommended)
+input double   InpRiskPerTradePct   = 1.0;            // Risk per trade (% of equity)
+input double   InpBaseLot           = 0.01;           // Base lot (if not using risk-based)
+input double   InpLotCapMax         = 0.05;           // Max lot cap (safety limit)
+
+input group "=== Martingale (DISABLED by default for low DD) ==="
+input ENUM_MARTINGALE_MODE InpMartingaleMode = MART_DISABLED; // Martingale mode (DISABLED=safe)
+input double   InpMartMultiplier    = 1.5;            // Martingale multiplier (1.5=conservative)
+input int      InpMartMaxLevel      = 0;              // Max martingale level (0=disabled)
 
 input group "=== Recovery TP (Martingale) ==="
-input bool     InpUseRecoveryTP     = true;           // Use Recovery TP when martLevel>0
+input bool     InpUseRecoveryTP     = false;          // Use Recovery TP when martLevel>0 (DISABLED=safe)
 input double   InpRecoveryFactor    = 1.05;           // Recovery factor (1.05 = recover 105%)
 input double   InpRecoveryBufferMoney = 0.0;          // Extra buffer money to recover ($)
 input int      InpMaxTPPoints       = 2000;           // Max TP distance (points)
@@ -735,7 +739,7 @@ int OnInit()
    CalculateLiquidityLevels();
    CalculateRollingLiquidity();
    
-   Print("SMC Scalp EA v3.7 initialized on ", tradeSym);
+   Print("SMC Scalp EA v3.71 initialized on ", tradeSym);
    Print("Magic: ", InpMagic, " | Bias Mode: ", EnumToString(InpBiasMode));
    Print("Bias TF: ", EnumToString(InpBiasTF), " | Entry TF: ", EnumToString(InpEntryTF));
    Print("Max SL Hits/Day: ", InpMaxSLHitsPerDay, " | Stop on SL Hits: ", InpStopTradingOnSLHits);
@@ -1220,13 +1224,51 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       // A deal was added - check if it's ours
       if(trans.symbol == tradeSym)
       {
-         Print("TRANS_DEBUG: Symbol matches, processing deal...");
+         // Select deal in history
+         if(!HistoryDealSelect(trans.deal))
+         {
+            PrintFormat("TRANS_DEBUG: Cannot select deal %I64u", trans.deal);
+            return;
+         }
          
-         // Check for SL hit (for daily SL counter)
-         CheckDealForSLHit(trans.deal);
+         // Check magic number
+         long dealMagic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+         if(dealMagic != InpMagic)
+         {
+            PrintFormat("TRANS_DEBUG: Magic mismatch - deal=%I64d expected=%d", dealMagic, InpMagic);
+            return;
+         }
          
-         // Update martingale level based on deal result
-         UpdateMartingaleFromDeal(trans.deal);
+         // Check if this is an exit deal (DEAL_ENTRY_OUT)
+         ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+         
+         if(dealEntry == DEAL_ENTRY_OUT || dealEntry == DEAL_ENTRY_OUT_BY)
+         {
+            // This is a close deal - update PnL
+            double dealProfit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+            double dealCommission = HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+            double dealSwap = HistoryDealGetDouble(trans.deal, DEAL_SWAP);
+            double totalPnL = dealProfit + dealCommission + dealSwap;
+            
+            g_dailyPnL += totalPnL;
+            
+            PrintFormat("[PNL_UPDATE] deal=%I64u entry=%s profit=%.2f comm=%.2f swap=%.2f total=%.2f dailyPnL=%.2f",
+                        trans.deal, EnumToString(dealEntry), dealProfit, dealCommission, dealSwap, totalPnL, g_dailyPnL);
+            
+            // Log trade result
+            string resultStr = (totalPnL > 0) ? "win" : (totalPnL < 0) ? "lose" : "breakeven";
+            LogTrade(resultStr, totalPnL);
+            
+            // Check for SL hit (for daily SL counter and exit classification)
+            CheckDealForSLHit(trans.deal);
+            
+            // Update martingale level based on deal result
+            UpdateMartingaleFromDeal(trans.deal);
+         }
+         else if(dealEntry == DEAL_ENTRY_IN)
+         {
+            PrintFormat("TRANS_DEBUG: DEAL_ENTRY_IN detected - entry deal, no PnL update");
+         }
       }
       else
       {
@@ -2336,7 +2378,29 @@ void PlaceOrder()
    // This ensures comment and lot use the SAME level
    int martLevelUsed = g_martLevel;
    
-   // Get current lot based on martingale (uses g_martLevel)
+   // === GET ENTRY PRICE AND SL FIRST (needed for risk-based lot) ===
+   if(g_sweepType == SWEEP_BULLISH)
+   {
+      orderType = ORDER_TYPE_BUY;
+      price = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
+      sl = g_slPrice;
+      // TP1 is milestone, actual TP is TP2 (Run to TP2)
+      tp = (g_tp2Price > 0) ? g_tp2Price : g_tp1Price;
+   }
+   else
+   {
+      orderType = ORDER_TYPE_SELL;
+      price = SymbolInfoDouble(tradeSym, SYMBOL_BID);
+      sl = g_slPrice;
+      // TP1 is milestone, actual TP is TP2 (Run to TP2)
+      tp = (g_tp2Price > 0) ? g_tp2Price : g_tp1Price;
+   }
+   
+   // === SET TEMP ENTRY PRICE FOR RISK-BASED LOT CALCULATION ===
+   double tempEntryPrice = price;  // Use actual entry price for lot calc
+   g_entryPrice = tempEntryPrice;  // Temporarily set for CalculateLot()
+   
+   // Get current lot based on risk-based sizing or martingale
    g_currentLot = CalculateLot();
    double finalLotUsed = g_currentLot;
    
@@ -2348,21 +2412,6 @@ void PlaceOrder()
    
    PrintFormat("ENTRY_PREP: martLevelUsed=%d finalLotUsed=%.2f signature=%s recLoss=%.2f",
                martLevelUsed, finalLotUsed, g_lastSetupSignature, g_recoveryLoss);
-   
-   if(g_sweepType == SWEEP_BULLISH)
-   {
-      orderType = ORDER_TYPE_BUY;
-      price = SymbolInfoDouble(tradeSym, SYMBOL_ASK);
-      sl = g_slPrice;
-      tp = g_tp1Price;
-   }
-   else
-   {
-      orderType = ORDER_TYPE_SELL;
-      price = SymbolInfoDouble(tradeSym, SYMBOL_BID);
-      sl = g_slPrice;
-      tp = g_tp1Price;
-   }
    
    // Normalize prices
    price = NormalizeDouble(price, _Digits);
@@ -2450,7 +2499,7 @@ void PlaceOrder()
                   dirStr, martLevelUsed, InpBaseLot, MathPow(InpMartMultiplier, martLevelUsed), finalLotUsed, comment);
       
       Print("Order placed: ", EnumToString(orderType), " Lot: ", g_currentLot, 
-            " Entry: ", price, " SL: ", sl, " TP1: ", tp, " Mode: ", EnumToString(g_tradeMode));
+            " Entry: ", price, " SL: ", sl, " TP1(milestone): ", g_tp1Price, " TP2(target): ", tp, " Mode: ", EnumToString(g_tradeMode));
       
       // Log setup success
       double distToTP1 = MathAbs(tp - price) / _Point;
@@ -2983,16 +3032,41 @@ void ManageTrade()
          
          if(closeVolume < minVolume)
          {
-            // Skip partial close - volume too small
+            // Volume too small for partial close - treat as TP1 milestone reached
+            // Set flags as if partial close was done, but don't actually close
             g_tp1PartialSkippedMinVol++;
-            PrintFormat("[TP1_PARTIAL_SKIP] reason=min_vol closeVol=%.2f minVol=%.2f", closeVolume, minVolume);
+            g_partialClosed = true;  // Prevent retry
+            g_tp1PartialDone = true;  // Mark TP1 milestone reached
+            g_beStageDone = true;     // Allow trailing to start
+            
+            // Move SL to BE (no partial close, but still protect profit)
+            double spreadPoints = GetSpreadPoints();
+            double newSL;
+            if(posType == POSITION_TYPE_BUY)
+               newSL = posOpenPrice + (spreadPoints + InpBEOffsetPoints) * _Point;
+            else
+               newSL = posOpenPrice - (spreadPoints + InpBEOffsetPoints) * _Point;
+            newSL = NormalizeDouble(newSL, _Digits);
+            
+            // Get current TP (should be TP2)
+            double currentTP = PositionGetDouble(POSITION_TP);
+            if(currentTP == 0) currentTP = g_tp2Price;
+            
+            if(trade.PositionModify(tradeSym, newSL, currentTP))
+            {
+               g_lastSLSource = SL_SRC_BE;
+               g_lastModifiedSL = newSL;
+               g_lastSLModifyTime = TimeCurrent();
+            }
+            PrintFormat("[TP1_MILESTONE] vol_too_small - flags set, SL moved to BE=%.5f, TP stays at %.5f", newSL, currentTP);
          }
          else if(trade.PositionClosePartial(tradeSym, closeVolume))
          {
             g_partialClosed = true;
             g_tp1PartialDone = true;  // Mark TP1 partial as done for trailing
+            g_beStageDone = true;     // TP1 partial also counts as BE stage
             
-            // Move SL to BE + spread + offset
+            // Move SL to BE + spread + offset, keep TP at TP2
             double spreadPoints = GetSpreadPoints();
             double newSL;
             
@@ -3003,15 +3077,18 @@ void ManageTrade()
             
             newSL = NormalizeDouble(newSL, _Digits);
             
-            if(trade.PositionModify(tradeSym, newSL, g_tp2Price))
+            // Get current TP (should be TP2)
+            double currentTP = PositionGetDouble(POSITION_TP);
+            if(currentTP == 0) currentTP = g_tp2Price;
+            
+            if(trade.PositionModify(tradeSym, newSL, currentTP))
             {
                g_lastSLSource = SL_SRC_BE;
                g_lastModifiedSL = newSL;
                g_lastSLModifyTime = TimeCurrent();
-               g_beStageDone = true;  // TP1 partial also counts as BE stage
             }
             
-            PrintFormat("[TP1_PARTIAL] closeVol=%.2f newSL=%.5f newTP=%.5f source=BE", closeVolume, newSL, g_tp2Price);
+            PrintFormat("[TP1_PARTIAL] closeVol=%.2f newSL=%.5f TP(kept)=%.5f source=BE", closeVolume, newSL, currentTP);
          }
       }
    }
@@ -3030,47 +3107,16 @@ void ManageTrade()
 }
 
 //+------------------------------------------------------------------+
-//| Check trade result after close                                     |
+//| Check trade result after close (DEPRECATED)                         |
+//| NOTE: PnL tracking moved to OnTradeTransaction for accuracy         |
+//| This function is kept for backward compatibility but does nothing   |
 //+------------------------------------------------------------------+
 void CheckTradeResult()
 {
-   // NOTE: Martingale level is now updated in UpdateMartingaleFromDeal() via OnTradeTransaction
-   // This function only handles logging and daily PnL tracking
-   
-   // Get last deal result
-   HistorySelect(TimeCurrent() - 86400, TimeCurrent());
-   
-   int totalDeals = HistoryDealsTotal();
-   if(totalDeals == 0) return;
-   
-   ulong dealTicket = HistoryDealGetTicket(totalDeals - 1);
-   if(dealTicket == 0) return;
-   
-   double dealProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-   double dealCommission = HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
-   double dealSwap = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
-   double totalPnL = dealProfit + dealCommission + dealSwap;
-   
-   g_dailyPnL += totalPnL;
-   
-   string result;
-   if(totalPnL > 0)
-   {
-      result = "win";
-   }
-   else if(totalPnL < 0)
-   {
-      result = "lose";
-   }
-   else
-   {
-      result = "breakeven";
-   }
-   
-   // Log trade
-   LogTrade(result, totalPnL);
-   
-   Print("Trade closed: ", result, " PnL: ", totalPnL, " Consec losses: ", g_consecLosses, " MartLevel: ", g_martLevel);
+   // PnL tracking is now done in OnTradeTransaction via DEAL_ENTRY_OUT
+   // This function is deprecated and does nothing
+   // Martingale level is updated in UpdateMartingaleFromDeal()
+   // Logging is done in OnTradeTransaction
 }
 
 //=== RISK MANAGEMENT ===
@@ -3442,13 +3488,43 @@ void LogBiasNone(string reason)
 }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size with martingale and mode adjustments            |
-//| Order: baseLot -> martingale -> modeFactor -> biasNoneFactor -> cap -> normalize
+//| Calculate lot size with risk-based sizing and martingale           |
+//| Order: riskBasedLot/baseLot -> martingale -> modeFactor -> biasNoneFactor -> cap -> normalize
 //+------------------------------------------------------------------+
 double CalculateLot()
 {
    double baseLot = InpBaseLot;
    double lot = baseLot;
+   
+   // === RISK-BASED LOT SIZING ===
+   // Calculate lot based on risk % of equity and SL distance
+   // Note: g_entryPrice is set temporarily before calling this function
+   if(InpUseRiskBasedLot && g_slPrice > 0 && g_entryPrice > 0)
+   {
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      double riskMoney = equity * InpRiskPerTradePct / 100.0;
+      double slDistancePoints = MathAbs(g_entryPrice - g_slPrice) / _Point;
+      
+      // Calculate point value for XAUUSD (typically $1 per point per lot)
+      double tickValue = SymbolInfoDouble(tradeSym, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize = SymbolInfoDouble(tradeSym, SYMBOL_TRADE_TICK_SIZE);
+      double pointValue = (tickValue / tickSize) * _Point;
+      
+      if(slDistancePoints > 0 && pointValue > 0)
+      {
+         double riskBasedLot = riskMoney / (slDistancePoints * pointValue);
+         baseLot = riskBasedLot;
+         PrintFormat("[RISK_LOT] equity=%.2f risk%%=%.1f riskMoney=%.2f slDist=%.0f pts pointVal=%.4f lot=%.4f",
+                     equity, InpRiskPerTradePct, riskMoney, slDistancePoints, pointValue, riskBasedLot);
+      }
+      else
+      {
+         PrintFormat("[RISK_LOT] Cannot calculate - slDist=%.0f pointVal=%.4f, using InpBaseLot=%.2f",
+                     slDistancePoints, pointValue, InpBaseLot);
+      }
+   }
+   
+   lot = baseLot;
    
    // Determine if martingale is allowed
    bool allowMartingale = true;
