@@ -185,6 +185,14 @@ input int      InpTrailCooldownSec   = 30;            // Cooldown between SL mod
 input bool     InpTrailUseTP1Gate    = true;          // Trail requires TP1 partial OR BEStartR reached
 input double   InpBEProfitEpsMoney   = 0.50;          // Profit threshold for BE_STOP classification ($)
 
+input group "=== Auto Tune Entry Filters ==="
+input bool     InpAutoTuneEntryFilters = true;        // Auto-tune entry filters based on cancel stats
+input int      InpNoSweepBreakReducePct = 20;          // Reduce SweepBreakPoints by this % when no_sweep high
+input int      InpChochMaxBarsIncrease = 4;            // Increase ChochMaxBars by this when choch_timeout high
+input int      InpAutoTuneMinCancels = 200;            // Min cancels before auto-tune kicks in
+input double   InpAutoTuneNoSweepThreshold = 0.45;     // Trigger if no_sweep/total > this (45%)
+input double   InpAutoTuneChochThreshold = 0.20;       // Trigger if choch_timeout/total > this (20%)
+
 input group "=== Risk Guardrails ==="
 input int      InpCooldownBars      = 3;              // Cooldown bars after close
 input int      InpMaxConsecLosses   = 3;              // Max consecutive losses
@@ -491,8 +499,7 @@ bool           g_beStageDone = false;        // BE stage completed (R >= BEStart
 ENUM_SL_SOURCE g_lastSLSource = SL_SRC_INITIAL;  // Current SL source
 double         g_lastModifiedSL = 0;             // Last modified SL price
 datetime       g_lastSLModifyTime = 0;           // Last SL modify timestamp
-double         g_entryPrice = 0;                 // Entry price for R calculation
-double         g_initialSL = 0;                  // Initial SL for R calculation
+double         g_initialSL = 0;                  // Initial SL for R calculation (g_entryPrice already declared above)
 
 // === MFE/MAE TRACKING (per trade) ===
 double         g_mfePoints = 0;              // Max Favorable Excursion (points)
