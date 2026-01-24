@@ -60,8 +60,9 @@ enum ENUM_LIQUIDITY_TYPE
 
 enum ENUM_MARTINGALE_MODE
 {
-   MART_OFF,
-   MART_AFTER_LOSS,
+   MART_DISABLED,     // Martingale disabled (safest)
+   MART_OFF,          // Same as disabled (legacy)
+   MART_AFTER_LOSS,   // Increase lot after loss
    MART_SCALE_IN      // stub for future
 };
 
@@ -3545,7 +3546,7 @@ double CalculateLot()
    }
    
    // Check if martingale mode is enabled
-   if(InpMartingaleMode != MART_AFTER_LOSS)
+   if(InpMartingaleMode == MART_DISABLED || InpMartingaleMode == MART_OFF || InpMartingaleMode != MART_AFTER_LOSS)
    {
       allowMartingale = false;
       martStatus = "DISABLED_OFF";
