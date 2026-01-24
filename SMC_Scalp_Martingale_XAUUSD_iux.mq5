@@ -2997,17 +2997,7 @@ void ManageTrade()
    // === APPLY TRAILING STOP ===
    if(!inRecoveryMode || !InpDisablePartialOnRecovery)
    {
-      // Check if martingale should be disabled when trailing
-      bool allowTrail = true;
-      if(InpDisableMartWhenTrailing && g_trailingActive && g_martLevel > 0)
-      {
-         // Trailing is active and martingale is on - skip trailing to avoid conflict
-         // Actually, we want to disable martingale when trailing, not skip trailing
-         // So we allow trailing but will check martingale later
-      }
-      
-      if(allowTrail)
-         ApplyTrailingStop();
+      ApplyTrailingStop();
    }
 }
 
